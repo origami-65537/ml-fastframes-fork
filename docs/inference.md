@@ -192,6 +192,53 @@ delete `temporal_filter_contract.json`, `filtered_temporal/` and `vbench_results
 before scoring again. Recompute aggregates with
 `uv run python evaluation/vbench/summarize.py --from-summary "$RUN/score_summary.json"`.
 
+### Fixed benchmark guard
+
+On a single CUDA GPU, save a lossless reference at the baseline commit, then run
+the same command without `--save-reference` after each change:
+
+```bash
+python evaluation/bench/fixed_bench.py --model ff-s --save-reference
+python evaluation/bench/fixed_bench.py --model ff-s
+python evaluation/bench/fixed_bench.py --model ff-s --profile
+python evaluation/bench/compare.py
+# Alternative workload (upstream example 00 by default):
+python evaluation/bench/fixed_bench.py --model lingbot-1.3b --lingbot-root "$LINGBOT_WORLD_ROOT" --save-reference
+```
+
+FastFrames-S uses 832x480, 81 frames, seed 0 and a fixed corgi prompt. LingBot uses
+its example prompt (override with `--prompt`) and rounds `--frames 81` down to
+whole chunks: normally 77 frames at 832x464. Actual shapes are recorded and checked.
+Use identical model weights, software, GPU and settings when comparing results.
+This is an explicit per-change command, not an automatically installed CI job.
+No GPU generation was validated on the CPU-only development VM; 16GB feasibility
+depends on model/runtime memory and is not guaranteed (especially LingBot).
+
+One untimed warm-up precedes three synchronized end-to-end generations (including
+CPU output transfer). Reports include all samples, median fps/ms per frame and peak
+allocated/reserved **decimal GB**. History is appended to `outputs/bench/history.jsonl`;
+full JSON records and optional trace/profile reports are under `outputs/bench/runs/`.
+Use `--history`, `--run-dir`, and `--reference-dir` to relocate artifacts.
+References are uint8 `.pt` tensors with a viewing-only MP4; keys include model,
+resolved prompt, seed, requested frames and example path. Do not overwrite a
+baseline reference on candidate commits. Reference creation refuses invalid video.
+
+Every frame must meet `--min-psnr 30`, `--min-ssim 0.90`, and, when the optional
+`lpips` package is installed, `--max-lpips 0.10`. LPIPS may download AlexNet weights
+on first use. Metrics report mean/min/max and per-frame values; infinite PSNR is
+serialized as the string `"inf"` for standards-compliant JSON. Constant/non-finite
+frames, shape changes and mean luma outside `[0.01,0.99]` fail independently of a
+reference (tune `--constant-eps`, `--min-luma`, `--max-luma` if necessary). Failures
+exit 1; a missing reference warns and exits 0 unless sanity/performance gates fail.
+Optionally use `--max-fps-drop 0.10` to fail a >10% median fps drop against the
+previous same-key history entry. The baseline must be run on the same GPU.
+
+`--profile` runs one extra untimed-for-benchmark generation, exports a Chrome trace,
+and summarizes top kernels, regex categories and union-of-GPU-intervals/wall busy
+ratio. Hints use simple thresholds: attention >40%, idle >15%, copies >5%, or over
+half of kernels <10 microseconds. These are diagnostic suggestions, not guaranteed
+speedups; profiler overhead can exaggerate idle time.
+
 ### Results (Table 1)
 
 | Model | Total | Quality | Semantic |
