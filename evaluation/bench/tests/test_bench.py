@@ -46,6 +46,16 @@ def test_sanity_errors():
     assert "non-finite pixels" in sanity(torch.full((1, 2, 2, 3), float("nan")))
 
 
+def test_solid_color_frame():
+    red = torch.zeros(1, 12, 12, 3, dtype=torch.uint8)
+    red[..., 0] = 255
+    assert sanity(red) == ["constant frame"]
+    varying = red.clone()
+    varying[:, :6, :, 0] = 100
+    assert "constant frame" not in sanity(varying)
+    assert "constant frame" in sanity(torch.cat([varying, red]))
+
+
 @pytest.mark.parametrize("case", ["normal", "constant", "empty", "reference", "shape"])
 def test_every_repeat(monkeypatch, tmp_path, capsys, case):
     generator = torch.Generator().manual_seed(0)

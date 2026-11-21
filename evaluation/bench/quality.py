@@ -14,7 +14,7 @@ def sanity(video, expected_shape=None, eps=1e-6, min_luma=0.01, max_luma=0.99):
     if video.dtype != torch.uint8:
         reasons.append("expected uint8 pixels")
     x = video.float() / 255
-    if (x.flatten(1).std(dim=1, unbiased=False) < eps).any():
+    if (x.flatten(1, 2).std(dim=1, unbiased=False) < eps).all(dim=-1).any():
         reasons.append("constant frame")
     luma = (x * x.new_tensor([0.299, 0.587, 0.114])).sum(-1).mean((1, 2))
     if ((luma < min_luma) | (luma > max_luma)).any():
