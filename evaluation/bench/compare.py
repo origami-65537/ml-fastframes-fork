@@ -29,6 +29,13 @@ def table(records):
                          f"{r['memory']['allocated_gb']:.3f}/{r['memory']['reserved_gb']:.3f}          "
                          f"{str(q.get('psnr', {}).get('mean', '-')):10.10} "
                          f"{str(q.get('ssim', {}).get('mean', '-')):10.10} {r['verdict']}")
+            lines.append("  metric        median      mean     stdev       min       max        CV")
+            for metric in ("fps", "ms_per_frame"):
+                stats = r.get(metric, {})
+                cells = [f"{stats[name]:9.3f}" if name in stats else f"{'-':>9}"
+                         for name in ("median", "mean", "stdev", "min", "max")]
+                cv = f"{stats['cv']:.2%}" if "cv" in stats else "-"
+                lines.append(f"  {metric:12} {' '.join(cells)} {cv:>9}")
     return "\n".join(lines)
 
 

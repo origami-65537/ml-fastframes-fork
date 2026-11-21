@@ -5,9 +5,11 @@ import pytest
 import torch
 
 from evaluation.bench.compare import append_history, read_history, table
-from evaluation.bench.fixed_bench import json_safe, workload_key
+from evaluation.bench.fixed_bench import json_safe, parser, workload_key
 from evaluation.bench.profiling import classify, profile_report
 from evaluation.bench.quality import compare, sanity, verdict
+from evaluation.bench.stages import TimingProxy, measure_stages, summarize_events
+from evaluation.bench.stats import sample_stats
 
 
 @pytest.fixture(autouse=True)
@@ -82,9 +84,113 @@ def test_profile(tmp_path):
     trace.write_text(json.dumps({"traceEvents": [
         {"cat": "kernel", "name": "flash_fwd", "ts": 0, "dur": 600},
         {"cat": "kernel", "name": "gemm", "ts": 300, "dur": 100}]}))
-    report = profile_report(trace, 0.001)
+    report = profile_report([trace] * 3, [0.001] * 3)
     assert "60.0%" in report
-    assert "Attention >40%" in report
-    assert "GPU idle >15%" in report
+    assert "attention 85.7%±0.0% over 3 runs" in report
+    assert "GPU idle 40.0%±0.0% over 3 runs" in report
+    assert "LOW-CONFIDENCE" not in report
+    assert "0.600 ± 0.000" in report
     trace.write_text('{"traceEvents": []}')
-    assert "Top 25" in profile_report(trace, 1)
+    empty = profile_report([trace], [1])
+    assert "No hints" in empty
+    assert "possible CPU" not in empty
+    with pytest.raises(ValueError):
+        profile_report([], [])
+
+
+def test_profile_variation(tmp_path):
+    traces = []
+    for i, duration in enumerate([450, 650, 950]):
+        trace = tmp_path / f"trace_{i}.json"
+        trace.write_text(json.dumps({"traceEvents": [
+            {"cat": "kernel", "name": "flash_fwd", "ts": 0, "dur": duration},
+            {"cat": "kernel", "name": "gemm", "ts": duration, "dur": 1000-duration}]}))
+        traces.append(trace)
+    report = profile_report(traces, [0.001] * 3)
+    assert "attention 68.3%±25.2% over 3 runs (CV 36.8%) exceeds 40%: LOW-CONFIDENCE" in report
+    assert "0.683 ± 0.252" in report
+
+
+def test_stats_and_defaults():
+    stats = sample_stats([2, 4, 6])
+    assert stats == {"samples": [2, 4, 6], "median": 4, "mean": 4, "stdev": 2,
+                     "min": 2, "max": 6, "cv": 0.5}
+    assert sample_stats([0])["cv"] == 0
+    with pytest.raises(ValueError):
+        sample_stats([])
+    args = parser().parse_args([])
+    assert (args.repeats, args.warmup, args.profile_repeats) == (10, 2, 3)
+    row = {"key": "a", "git": {"sha": "abc"}, "fps": stats, "ms_per_frame": stats,
+           "memory": {"allocated_gb": 1, "reserved_gb": 2}, "verdict": "pass"}
+    report = table([row])
+    assert "ms_per_frame" in report and "50.00%" in report and "stdev" in report
+
+
+def test_stage_proxy():
+    class Event:
+        def record(self):
+            pass
+
+        def elapsed_time(self, end):
+            return 2.5
+
+    class Target:
+        attribute = "forwarded"
+
+        def __call__(self, x):
+            if x is None:
+                raise ValueError("failed")
+            return x + 1
+
+    events = []
+    chunk = [0]
+    proxy = TimingProxy(Target(), "dit", events, lambda: chunk[0], Event)
+    assert proxy.attribute == "forwarded"
+    assert proxy(2) == 3
+    proxy(2)
+    chunk[0] = 1
+    proxy(2)
+    assert summarize_events(events)["dit"]["samples"] == [5, 2.5]
+    assert summarize_events(events)["dit"]["median"] == 3.75
+    assert summarize_events([]) == {}
+    with pytest.raises(ValueError, match="failed"):
+        proxy(None)
+    assert len(events) == 3
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_stage_restoration(monkeypatch, fail):
+    class Pipe:
+        dit = staticmethod(lambda x: x)
+        refiner = staticmethod(lambda x: x)
+        decoder = staticmethod(lambda x: x)
+
+    class Event:
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, end):
+            return 1
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    pipe = Pipe()
+    originals = [pipe.dit, pipe.refiner, pipe.decoder]
+
+    def generate():
+        pipe.dit(1)
+        if fail:
+            raise ValueError("generation failed")
+        pipe.decoder(1)
+
+    if fail:
+        with pytest.raises(ValueError, match="generation failed"):
+            measure_stages(pipe, generate, lambda: 0)
+    else:
+        result = measure_stages(pipe, generate, lambda: 0)
+        assert result["stages"]["dit"]["median"] == 1
+        assert "refiner" not in result["stages"]
+    assert [pipe.dit, pipe.refiner, pipe.decoder] == originals

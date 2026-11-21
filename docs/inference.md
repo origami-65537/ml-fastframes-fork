@@ -201,9 +201,11 @@ the same command without `--save-reference` after each change:
 python evaluation/bench/fixed_bench.py --model ff-s --save-reference
 python evaluation/bench/fixed_bench.py --model ff-s
 python evaluation/bench/fixed_bench.py --model ff-s --profile
+python evaluation/bench/fixed_bench.py --model ff-s --warmup 2 --repeats 10 --profile --profile-repeats 3
 python evaluation/bench/compare.py
 # Alternative workload (upstream example 00 by default):
 python evaluation/bench/fixed_bench.py --model lingbot-1.3b --lingbot-root "$LINGBOT_WORLD_ROOT" --save-reference
+python evaluation/bench/fixed_bench.py --model lingbot-1.3b --lingbot-root "$LINGBOT_WORLD_ROOT" --stage-timing
 ```
 
 FastFrames-S uses 832x480, 81 frames, seed 0 and a fixed corgi prompt. LingBot uses
@@ -214,8 +216,9 @@ This is an explicit per-change command, not an automatically installed CI job.
 No GPU generation was validated on the CPU-only development VM; 16GB feasibility
 depends on model/runtime memory and is not guaranteed (especially LingBot).
 
-One untimed warm-up precedes three synchronized end-to-end generations (including
-CPU output transfer). Reports include all samples, median fps/ms per frame and peak
+Two untimed warm-ups (`--warmup`, nonnegative) precede ten synchronized end-to-end
+generations (`--repeats`, positive), including CPU output transfer. Reports include
+all samples, median/mean/sample-stdev/min/max/CV for fps and ms per frame, and peak
 allocated/reserved **decimal GB**. History is appended to `outputs/bench/history.jsonl`;
 full JSON records and optional trace/profile reports are under `outputs/bench/runs/`.
 Use `--history`, `--run-dir`, and `--reference-dir` to relocate artifacts.
@@ -233,11 +236,36 @@ exit 1; a missing reference warns and exits 0 unless sanity/performance gates fa
 Optionally use `--max-fps-drop 0.10` to fail a >10% median fps drop against the
 previous same-key history entry. The baseline must be run on the same GPU.
 
-`--profile` runs one extra untimed-for-benchmark generation, exports a Chrome trace,
-and summarizes top kernels, regex categories and union-of-GPU-intervals/wall busy
-ratio. Hints use simple thresholds: attention >40%, idle >15%, copies >5%, or over
-half of kernels <10 microseconds. These are diagnostic suggestions, not guaranteed
-speedups; profiler overhead can exaggerate idle time.
+`--profile` runs three extra generations in separate profiler sessions
+(`--profile-repeats N`), exporting `trace_00.json`, etc. `profile.md` aggregates
+kernel calls and mean±sample-stdev ms/run (absent kernels count as zero), category
+mean±stdev percentages, union-of-GPU-intervals/wall busy ratio and idle variance.
+The JSON record links every trace and records profiler wall-time samples.
+CV means sample stdev / absolute mean (zero for all-zero samples); singleton
+stdev is reported as zero but does not establish repeatability. Old history
+entries without new statistics display `-` for missing fields.
+
+Hints cite their measured mean, stdev, CV and run count. Thresholds remain
+attention >40% of GPU time, idle >15% of wall time, copies >5% of GPU time, or over
+half of kernels <10 microseconds. A hint is **low-confidence** if its measurement
+has CV >5% or only one run. Missing GPU events suppress hints rather than imply
+CPU bottlenecks. Categories are name-based classifications of measured kernel
+durations, not estimated performance; recommendations are hypotheses, not measured
+speedups. Profiler overhead can exaggerate idle time.
+
+`--stage-timing` (LingBot only) runs one additional diagnostic generation after
+timing/profiling, with CUDA-event proxies around `pipe.dit`, `pipe.refiner` and
+`pipe.decoder` call objects. It prints and records median **summed ms/chunk** and
+all chunk samples. DiT includes its first-chunk clean pass; the refiner has no
+chunk-0 sample. Events bracket the outer, already-warmed call/graph replay, not
+captured graph bodies. Current single-GPU implementations enqueue replay on the
+current stream. Compilation/capture should already be warmed by the timed runs.
+No application code is patched and proxies are restored even on failure.
+These measurements exclude camera rays, `dit.begin_chunk`, encoding in `start`,
+scheduler work and output conversion; they are not a complete stage decomposition
+or a repeatability claim. Event instrumentation runs separately to avoid changing
+benchmark fps/VRAM. CUDA-event timing is implemented but **not GPU-validated on this
+CPU-only VM**; graph replay/device behavior must be validated on the target GPU.
 
 ### Results (Table 1)
 
