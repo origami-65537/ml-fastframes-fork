@@ -24,6 +24,7 @@ on one GPU or context parallel on eight GPUs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import torch
@@ -104,7 +105,9 @@ class FastFramesLingBot:
         scheduler = upstream.scheduler
         scheduler.set_timesteps(upstream.config.num_train_timesteps, shift=model.shift)
         self.scheduler = scheduler
-        self.schedule = scheduler.timesteps[[0, 250, 500, 750]]
+        steps = int(os.environ.get("LB_STEPS", 4))
+        indices = [round(i) for i in torch.linspace(0, 750, steps).tolist()]
+        self.schedule = scheduler.timesteps[indices]
         self.timesteps = tuple(int(t) for t in self.schedule)
         # sigma of every step, located like the upstream flow -> x0 conversion (float64)
         sigmas, grid = scheduler.sigmas.double(), scheduler.timesteps.double()
@@ -116,14 +119,18 @@ class FastFramesLingBot:
         self.cache_k = torch.zeros(shape, device=self.device, dtype=torch.bfloat16)
         self.cache_v = torch.zeros_like(self.cache_k)
         context = torch.zeros(512, 4096, device=self.device, dtype=torch.bfloat16)
+        env = lambda name, default: os.environ.get(name, str(int(default))) == "1"  # noqa: E731
         self.dit = LingBotDiT(dit, self.cache_k, self.cache_v, context, self.timesteps, world=world, rank=rank,
-                              split_kv=model.split_kv[world], compile=compile, graphs=graphs)
+                              split_kv=model.split_kv[world], compile=env("LB_COMPILE_DIT", compile),
+                              graphs=env("LB_GRAPHS_DIT", graphs))
         result = self.dit.result
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
                                  self.timesteps[-1], world=world, rank=rank,
-                                 heads_per_stream=model.kv_layers_per_stream[world], compile=compile, graphs=graphs)
+                                 heads_per_stream=model.kv_layers_per_stream[world],
+                                 compile=env("LB_COMPILE_REFINER", compile), graphs=env("LB_GRAPHS_REFINER", graphs))
         decoder_cls = CapturedDecoder if world == 1 else SpatialDecoder
-        self.decoder = decoder_cls(decoder, compile=compile, graphs=graphs)
+        self.decoder = decoder_cls(decoder, compile=env("LB_COMPILE_DECODER", compile),
+                                   graphs=env("LB_GRAPHS_DECODER", graphs))
         self.prompt = self.condition = self.noise = self.generator = None
         self.noise_mode = "clip"
         self.latents = self.chunk = 0
@@ -147,6 +154,21 @@ class FastFramesLingBot:
         return self.latents // CHUNK
 
     # ------------------------------------------------------------------ session
+    def _park_cache(self):
+        """Move the (still-zero) rolling KV cache, the DiT and the camera buffer to the
+        CPU while conditioning; ``_unpark_cache`` restores them."""
+        self.dit.model.cpu()
+        self.dit.camera_params.data = self.dit.camera_params.data.cpu()
+        self.cache_k.data = self.cache_k.data.cpu()
+        self.cache_v.data = self.cache_v.data.cpu()
+        torch.cuda.empty_cache()
+
+    def _unpark_cache(self):
+        self.dit.camera_params.data = self.dit.camera_params.data.to(self.device)
+        self.dit.model.to(self.device)
+        self.cache_k.data = self.cache_k.data.to(self.device)
+        self.cache_v.data = self.cache_v.data.to(self.device)
+
     @torch.inference_mode()
     def start(self, image, prompt, *, seed=0, latents=240, noise="clip"):
         """Begin a video from a PIL ``image`` and ``prompt`` with a horizon of ``latents`` latent frames.
@@ -157,10 +179,17 @@ class FastFramesLingBot:
         """
         if latents % CHUNK or not CHUNK <= latents <= MAX_LATENTS:
             raise ValueError(f"latents must be a multiple of {CHUNK} in [{CHUNK}, {MAX_LATENTS}]")
-        if prompt != self.prompt:
-            self.dit.set_context(text_context(self.upstream.text_encoder, prompt, self.device))
+        new_prompt = prompt != self.prompt
+        if new_prompt:
+            context = text_context(self.upstream.text_encoder, prompt, self.device)
+        self._park_cache()
+        try:
+            self.condition = image_condition(self.upstream.vae, image, latents, self.device)
+        finally:
+            self._unpark_cache()
+        if new_prompt:
+            self.dit.set_context(context)
             self.prompt = prompt
-        self.condition = image_condition(self.upstream.vae, image, latents, self.device)
         self.latents = latents
         self.restart(seed=seed, noise=noise)
 

@@ -30,6 +30,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -42,8 +44,8 @@ __all__ = ["LingBotDiT", "DiTResult", "rope_real", "rope_table", "rope_frequenci
 GRID_H, GRID_W = LATENT_HEIGHT // 2, LATENT_WIDTH // 2
 FRAME_TOKENS = GRID_H * GRID_W          # 1508
 TOKENS = CHUNK * FRAME_TOKENS           # 6032
-CACHE_FRAMES = 18                       # rolling cache, including the current chunk
-READ_FRAMES = (4, 8, 12, 16, 18)
+CACHE_FRAMES = int(os.environ.get("LB_CACHE_FRAMES", 18))  # rolling cache, incl. current chunk
+READ_FRAMES = tuple(dict.fromkeys(list(range(CHUNK, CACHE_FRAMES + 1, CHUNK)) + [CACHE_FRAMES]))
 
 
 @torch.library.custom_op("fastframes_lingbot::all_gather_into", mutates_args=("out",))
