@@ -4,6 +4,7 @@ import math
 import pytest
 import torch
 
+from evaluation.bench import fixed_bench
 from evaluation.bench.compare import append_history, read_history, table
 from evaluation.bench.fixed_bench import json_safe, parser, workload_key
 from evaluation.bench.profiling import classify, profile_report
@@ -43,6 +44,50 @@ def test_sanity_errors():
     assert "constant frame" in sanity(torch.zeros(1, 2, 2, 3, dtype=torch.uint8))
     assert "mean luminance out of range" in sanity(torch.full((1, 2, 2, 3), 255, dtype=torch.uint8))
     assert "non-finite pixels" in sanity(torch.full((1, 2, 2, 3), float("nan")))
+
+
+@pytest.mark.parametrize("case", ["normal", "constant", "empty", "reference", "shape"])
+def test_every_repeat(monkeypatch, tmp_path, capsys, case):
+    generator = torch.Generator().manual_seed(0)
+    good = torch.randint(40, 210, (2, 12, 12, 3), generator=generator, dtype=torch.uint8)
+    first = {"normal": good, "constant": torch.zeros_like(good), "empty": good[:0],
+             "reference": 255-good, "shape": good[:1]}[case]
+    videos = iter([first, good])
+    monkeypatch.setattr(fixed_bench, "adapter", lambda args:
+                        (lambda: next(videos), lambda: None, good.shape, None))
+    for name in ("set_device", "synchronize", "reset_peak_memory_stats"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "fake CPU test")
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(fixed_bench, "workload_key", lambda config: "test")
+    calls = []
+
+    def compare_repeat(video, reference):
+        calls.append(video.shape)
+        return compare(video, reference, with_lpips=False)
+
+    monkeypatch.setattr(fixed_bench, "compare", compare_repeat)
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+    if case in ("reference", "shape", "normal"):
+        torch.save(good, reference_dir / "test.pt")
+    history = tmp_path / "history.jsonl"
+    result = fixed_bench.main(["--warmup", "0", "--repeats", "2", "--reference-dir", str(reference_dir),
+                               "--history", str(history), "--run-dir", str(tmp_path / "runs")])
+    record = read_history(history)[0]
+    assert result == int(case != "normal")
+    assert len(record["repeat_quality"]) == 2
+    assert record["repeat_quality"][1]["verdict"] != "fail"
+    if case != "normal":
+        assert record["repeat_quality"][0]["verdict"] == "fail"
+        assert all(reason.startswith("repeat 1:") for reason in record["reasons"])
+        assert "FAIL: repeat 1:" in capsys.readouterr().out
+    if case in ("reference", "normal"):
+        assert len(calls) == 2
+    elif case == "shape":
+        assert len(calls) == 1
 
 
 def test_verdicts():

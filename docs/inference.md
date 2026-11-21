@@ -236,6 +236,16 @@ exit 1; a missing reference warns and exits 0 unless sanity/performance gates fa
 Optionally use `--max-fps-drop 0.10` to fail a >10% median fps drop against the
 previous same-key history entry. The baseline must be run on the same GPU.
 
+Every timed repeat is checked after its timer stops, then discarded before the
+next generation (only the last video is retained for optional reference saving).
+Any failed repeat fails the run, with 1-based repeat numbers in failure reasons
+and per-repeat metrics/verdicts under `repeat_quality` in JSON. The legacy top-level
+`quality` table columns describe the last repeat, not the whole run. Existing
+references are compared on every repeat even with `--save-reference`; replacement
+is refused if any repeat fails. Quality checks are outside generation wall timing
+but add CPU work between trials. Empty output fails quality and reports zero
+fps/ms-per-frame for that invalid sample rather than dividing by zero.
+
 `--profile` runs three extra generations in separate profiler sessions
 (`--profile-repeats N`), exporting `trace_00.json`, etc. `profile.md` aggregates
 kernel calls and mean±sample-stdev ms/run (absent kernels count as zero), category

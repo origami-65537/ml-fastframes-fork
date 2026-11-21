@@ -142,10 +142,16 @@ def main(argv=None):
                 warmup = generate()
                 torch.cuda.synchronize()
                 del warmup
+            refpath = args.reference_dir / f"{key}.pt"
+            has_reference = refpath.exists()
+            reference = torch.load(refpath, map_location="cpu", weights_only=True) if has_reference else None
+            if not has_reference and not args.save_reference:
+                print(f"WARNING: no reference at {refpath}; use --save-reference at the baseline commit")
             torch.cuda.reset_peak_memory_stats()
             seconds, counts = [], []
+            repeat_quality, reasons = [], []
             video = None
-            for _ in range(args.repeats):
+            for index in range(args.repeats):
                 del video
                 torch.cuda.synchronize()
                 start = time.perf_counter()
@@ -153,14 +159,25 @@ def main(argv=None):
                 torch.cuda.synchronize()
                 seconds.append(time.perf_counter() - start)
                 counts.append(len(video))
+                video = torch.as_tensor(video).cpu()
+                metrics = {}
+                repeat_reasons = sanity(video, expected, args.constant_eps, args.min_luma, args.max_luma)
+                if reference is not None:
+                    if reference.shape != video.shape:
+                        repeat_reasons.append(
+                            f"reference shape mismatch: {tuple(reference.shape)} != {tuple(video.shape)}")
+                    elif video.ndim == 4 and video.shape[-1] == 3 and video.numel():
+                        metrics = compare(video, reference)
+                repeat_status, repeat_reasons = verdict(metrics, repeat_reasons, has_reference,
+                                                        args.min_psnr, args.min_ssim, args.max_lpips)
+                repeat_quality.append({"repeat": index + 1, "actual_shape": list(video.shape),
+                                       "quality": metrics, "verdict": repeat_status, "reasons": repeat_reasons})
+                reasons.extend(f"repeat {index + 1}: {reason}" for reason in repeat_reasons)
             memory = {"allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
                       "reserved_gb": torch.cuda.max_memory_reserved() / 1e9}
-            video = torch.as_tensor(video).cpu()
+            actual_shape = list(video.shape)
             fps = [n / s for n, s in zip(counts, seconds)]
-            reasons = sanity(video, expected, args.constant_eps, args.min_luma, args.max_luma)
-            refpath = args.reference_dir / f"{key}.pt"
-            metrics = {}
-            has_reference = refpath.exists()
+            reference_saved = False
             if args.save_reference:
                 if not reasons:
                     from fastframes.video import save_video
@@ -168,27 +185,22 @@ def main(argv=None):
                     save_video(refpath.with_suffix(".mp4"), video)
                     torch.save(video, refpath)
                     has_reference = True
-            elif has_reference:
-                reference = torch.load(refpath, map_location="cpu", weights_only=True)
-                if reference.shape != video.shape:
-                    reasons.append(f"reference shape mismatch: {tuple(reference.shape)} != {tuple(video.shape)}")
-                else:
-                    metrics = compare(video, reference)
-            else:
-                print(f"WARNING: no reference at {refpath}; use --save-reference at the baseline commit")
+                    reference_saved = True
+            del video, reference
             previous = next((r for r in reversed(read_history(args.history)) if r["key"] == key), None)
-            status, reasons = verdict(metrics, reasons, has_reference, args.min_psnr, args.min_ssim,
+            status, reasons = verdict({}, reasons, has_reference, args.min_psnr, args.min_ssim,
                                       args.max_lpips, statistics.median(fps),
                                       previous["fps"]["median"] if previous else None, args.max_fps_drop)
             record = {"key": key, "config": config, "timestamp": timestamp,
                       "git": {"sha": sha, "dirty": bool(git("status", "--porcelain"))},
                       "gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "args": vars(args),
-                      "actual_shape": list(video.shape), "expected_shape": expected,
+                      "actual_shape": actual_shape, "expected_shape": expected,
                       "note": "LingBot uses whole chunks at 832x464, not 832x480" if args.model != "ff-s" else "",
                       "fps": sample_stats(fps), "seconds": seconds,
-                      "ms_per_frame": sample_stats([1000/f for f in fps]),
-                      "memory": memory, "quality": metrics, "verdict": status, "reasons": reasons,
-                      "reference": str(refpath), "reference_saved": args.save_reference and not reasons}
+                      "ms_per_frame": sample_stats([1000/f if f else 0.0 for f in fps]),
+                      "memory": memory, "quality": metrics, "quality_scope": "last timed repeat",
+                      "repeat_quality": repeat_quality, "verdict": status, "reasons": reasons,
+                      "reference": str(refpath), "reference_saved": reference_saved}
             if args.profile:
                 traces, walls = [], []
                 for index in range(args.profile_repeats):
@@ -212,7 +224,7 @@ def main(argv=None):
             Path(str(run) + ".json").write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
             append_history(args.history, record)
             print(table([record]))
-            print(f"Actual video: {list(video.shape)}. {record['note']}")
+            print(f"Actual video: {actual_shape}. {record['note']}")
             if args.stage_timing:
                 for name, stats in record["stage_timing"]["stages"].items():
                     print(f"{name}: {stats['median']:.3f} median ms/chunk ({len(stats['samples'])} chunks)")
