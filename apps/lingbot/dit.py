@@ -99,8 +99,12 @@ def layer_norm(value, module):
     return F.layer_norm(value.float(), (value.shape[-1],), weight, bias, module.eps).to(value.dtype)
 
 
-def attention(query, key, value, split=1):
+def attention(query, key, value, split=1, sage=False):
     """``query [1, Q, H, D]`` over ``key, value [1, K, H, D]`` with cuDNN; exact split-KV merge."""
+    if sage and split == 1:
+        from .sage_attention import sage_attention
+
+        return sage_attention(query, key, value)
     q = query.transpose(1, 2)
     if split == 1:
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
@@ -144,6 +148,12 @@ class LingBotDiT:
         self.head_dim, self.layers = self.dim // self.heads, len(model.blocks)
         self.device = model.patch_embedding.weight.device
         self.split_kv, self.use_graphs = int(split_kv), bool(graphs)
+        self.sage_self = os.environ.get("LB_ATTN") == "sage" and self.world == 1 and self.split_kv == 1
+        self.sage_cross = os.environ.get("LB_ATTN_CROSS") == "sage" and self.world == 1
+        if self.sage_self or self.sage_cross:
+            from .sage_attention import load_sage
+
+            load_sage()
         self.timesteps = tuple(int(t) for t in timesteps) + (0,)
         self.final_timestep = self.timesteps[-2]
         if TOKENS % self.world or (CACHE_FRAMES * FRAME_TOKENS) % self.split_kv:
@@ -284,13 +294,13 @@ class LingBotDiT:
         cache_k[:, end - TOKENS:end].copy_(physical_key)
         cache_v[:, end - TOKENS:end].copy_(val)
         split = self.split_kv if end % self.split_kv == 0 else 1
-        attended = attention(query, cache_k[:, :end], cache_v[:, :end], split)
+        attended = attention(query, cache_k[:, :end], cache_v[:, :end], split, sage=self.sage_self)
         value = value + F.linear(attended.reshape(1, tokens, self.dim), a.o.weight, a.o.bias) * e[2]
         # Upstream forms 1 + camera_scale in BF16 before the FP32 residual product.
         value = (1.0 + cam[0]) * value + cam[1]
         cross = block.cross_attn
         q = rms_norm(cross.q(layer_norm(value, block.norm3)), cross.norm_q).view(1, tokens, heads, head_dim)
-        value = value + cross.o(attention(q, text_k, text_v).reshape(1, tokens, self.dim))
+        value = value + cross.o(attention(q, text_k, text_v, sage=self.sage_cross).reshape(1, tokens, self.dim))
         hidden = layer_norm(value, block.norm2).float() * (1 + e[4]) + e[3]
         return value + block.ffn(hidden) * e[5]
 
