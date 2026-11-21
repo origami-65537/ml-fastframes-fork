@@ -184,9 +184,15 @@ class LingBotDiT:
             torch.empty(shape, device=device, dtype=torch.bfloat16),
             torch.empty(shape, device=device, dtype=torch.bfloat16))
         self.patch_weight = model.patch_embedding.weight.reshape(dim, -1).contiguous()
-        self.qkv = [(torch.cat([b.self_attn.q.weight, b.self_attn.k.weight, b.self_attn.v.weight]).contiguous(),
-                     torch.cat([b.self_attn.q.bias, b.self_attn.k.bias, b.self_attn.v.bias]).contiguous())
-                    for b in model.blocks]
+        self.use_fp8 = os.environ.get("LB_FP8") == "1"
+        if self.use_fp8:
+            from .fp8 import quantize_dit
+
+            self.qkv = [(linear, None) for linear in quantize_dit(model)]
+        else:
+            self.qkv = [(torch.cat([b.self_attn.q.weight, b.self_attn.k.weight, b.self_attn.v.weight]).contiguous(),
+                         torch.cat([b.self_attn.q.bias, b.self_attn.k.bias, b.self_attn.v.bias]).contiguous())
+                        for b in model.blocks]
         self.cam = [(torch.cat([b.cam_scale_layer.weight, b.cam_shift_layer.weight]).contiguous(),
                      torch.cat([b.cam_scale_layer.bias, b.cam_shift_layer.bias]).contiguous())
                     for b in model.blocks]
@@ -274,7 +280,8 @@ class LingBotDiT:
         e = (block.modulation.unsqueeze(0) + self.time_e0).unbind(2)
         hidden = layer_norm(value, block.norm1).float() * (1 + e[1]) + e[0]
         a = block.self_attn
-        query, key, val = F.linear(hidden, qkv_weight, qkv_bias).chunk(3, -1)
+        qkv = qkv_weight(hidden) if self.use_fp8 else F.linear(hidden, qkv_weight, qkv_bias)
+        query, key, val = qkv.chunk(3, -1)
         query = rms_norm(query, a.norm_q).view(1, tokens, heads, head_dim)
         key = rms_norm(key, a.norm_k).view(1, tokens, heads, head_dim)
         val = val.view(1, tokens, heads, head_dim)
