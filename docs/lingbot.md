@@ -39,10 +39,12 @@ settings failed the quality gate against the BF16/cuDNN reference. Side-by-side 
 showed trajectory drift around frames 15–25, rather than visible noise or color shifts.
 Keep FP8 off when the fixed-benchmark quality gate must pass.
 
-On the same GPU, DiT denoising graph warmup ran out of memory during the first step of the two-start smoke
-test. Set `LB_GRAPHS_DIT=0` to run DiT without CUDA graphs while keeping DiT compilation
-enabled. With that setting, both starts produced bit-identical first chunks even with
-refiner and decoder graphs left on.
+DiT CUDA graphs are off by default on one GPU; this does not disable DiT compilation
+or change the refiner and decoder graph settings. On the RTX 5060 Ti 16 GB, DiT graph
+warmup ran out of memory during the first step of the two-start smoke test. With DiT
+graphs off, both starts produced bit-identical first chunks even with refiner and
+decoder graphs on. Set `LB_GRAPHS_DIT=1` to opt in on a GPU with enough memory, or
+`LB_GRAPHS_DIT=0` to turn them off on eight GPUs, where the default is unchanged.
 
 ## Interactive demo (1.3B)
 
