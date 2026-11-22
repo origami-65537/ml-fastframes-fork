@@ -65,12 +65,76 @@ def test_graphs_cleared_before_park():
     assert mock.mock_calls == [call.dit.clear_graphs(), call.refiner.clear_graphs(), call.dit.model.cpu()]
 
 
+@torch.no_grad()
+def test_sliced_camera_matches_full_bank_and_tracks_storage(monkeypatch):
+    for name, size in (("CHUNK", 2), ("GRID_H", 1), ("GRID_W", 2), ("TOKENS", 4)):
+        monkeypatch.setattr(dit, name, size)
+    runner = dit.LingBotDiT.__new__(dit.LingBotDiT)
+    m = runner.model = torch.nn.Module()
+    m.patch_embedding_wancamctrl = torch.nn.Linear(384 * 4, 8)
+    m.c2ws_hidden_states_layer1 = torch.nn.Linear(8, 8)
+    m.c2ws_hidden_states_layer2 = torch.nn.Linear(8, 8)
+    m.blocks = torch.nn.ModuleList(torch.nn.Module() for _ in range(3))
+    for block in m.blocks:
+        block.cam_injector_layer1 = torch.nn.Linear(8, 8)
+        block.cam_injector_layer2 = torch.nn.Linear(8, 8)
+    runner.cam = [(torch.randn(16, 8), torch.randn(16)) for _ in m.blocks]
+    runner.start, runner.end = 1, 3
+    runner.camera = torch.randn(1, 384, 2, 2, 4, dtype=torch.bfloat16)
+    runner.camera_params = torch.empty(3, 2, 1, 2, 8, dtype=torch.bfloat16)
+    runner._camera_project_run = torch.compile(runner._project_camera, backend="aot_eager", fullgraph=True)
+    write_layer = torch.compile(dit._write_camera_layer, backend="aot_eager", fullgraph=True)
+    destinations = []
+
+    def write_slice(camera, block, params, dst):
+        destinations.append(dst)
+        write_layer(camera, block, params, dst)
+
+    runner._camera_layer_run = write_slice
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        runner._prepare_camera()
+        old_storage = runner.camera_params.detach()
+        expected = old_storage.clone()
+        runner.camera_params.data = torch.zeros_like(old_storage)
+        runner._prepare_camera_sliced()
+    assert [dst.data_ptr() for dst in destinations] == [layer.data_ptr() for layer in runner.camera_params]
+    assert [dst.numel() for dst in destinations] == [expected[0].numel()] * len(m.blocks)
+    torch.testing.assert_close(old_storage, expected, rtol=0, atol=0)
+    torch.testing.assert_close(runner.camera_params, expected, rtol=0, atol=0)
+
+
 @pytest.fixture
 def upstream():
     grid = torch.arange(1000)
     scheduler = SimpleNamespace(timesteps=grid, sigmas=grid, set_timesteps=Mock())
     dit = SimpleNamespace(patch_embedding=torch.nn.Linear(1, 1), blocks=[None], dim=1, num_heads=1)
     return SimpleNamespace(dit=dit, scheduler=scheduler, config=SimpleNamespace(num_train_timesteps=1000))
+
+
+@pytest.mark.parametrize(("world", "compile", "env", "expected"), [
+    (1, True, {}, True),
+    (1, False, {}, False),
+    (8, True, {}, False),
+    (1, True, {"LB_COMPILE_DIT": "0"}, False),
+    (1, False, {"LB_COMPILE_DIT": "1"}, True),
+    (1, True, {"LB_DIT_CAMERA_SLICED": "0"}, False),
+])
+def test_sliced_camera_defaults_to_single_gpu_with_compiled_dit(world, compile, env, expected, monkeypatch, upstream):
+    for flag in ("LB_DIT_CAMERA_SLICED", "LB_COMPILE_DIT"):
+        monkeypatch.delenv(flag, raising=False)
+    for flag, value in env.items():
+        monkeypatch.setenv(flag, value)
+    with (patch.object(pipeline, "LingBotDiT") as runner, patch.object(pipeline, "KVRefiner"),
+          patch.object(pipeline, "CapturedDecoder"), patch.object(pipeline, "SpatialDecoder"),
+          patch.object(pipeline, "rope_frequencies")):
+        pipeline.FastFramesLingBot(pipeline.MODELS["lingbot-1.3b"], upstream, None, None,
+                                   world=world, compile=compile, graphs=False)
+    assert runner.call_args.kwargs["camera_sliced"] is expected
+
+
+def test_explicitly_sliced_camera_requires_dit_compilation():
+    with pytest.raises(ValueError, match="requires DiT compilation"):
+        dit.LingBotDiT(None, None, None, None, (), compile=False, camera_sliced=True)
 
 
 @pytest.mark.parametrize(
