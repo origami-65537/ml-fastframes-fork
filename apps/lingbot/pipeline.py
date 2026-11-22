@@ -198,13 +198,16 @@ class FastFramesLingBot:
         if latents % CHUNK or not CHUNK <= latents <= MAX_LATENTS:
             raise ValueError(f"latents must be a multiple of {CHUNK} in [{CHUNK}, {MAX_LATENTS}]")
         new_prompt = prompt != self.prompt
+        offload = self.world == 1
         if new_prompt:
-            context = text_context(self.upstream.text_encoder, prompt, self.device)
-        self._park_cache()
+            context = text_context(self.upstream.text_encoder, prompt, self.device, cpu_encode=offload)
+        if offload:
+            self._park_cache()
         try:
-            self.condition = image_condition(self.upstream.vae, image, latents, self.device)
+            self.condition = image_condition(self.upstream.vae, image, latents, self.device, offload=offload)
         finally:
-            self._unpark_cache()
+            if offload:
+                self._unpark_cache()
         if new_prompt:
             self.dit.set_context(context)
             self.prompt = prompt

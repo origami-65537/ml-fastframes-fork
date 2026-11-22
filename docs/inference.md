@@ -91,6 +91,8 @@ uv run python scripts/generate.py --model ff-s --prompt "A corgi surfing a wave 
 
 Use `--model ff-l` for FastFrames-L or `--checkpoint-dir` to change the weights
 directory. Both produce 832 × 480 H.264 MP4s, with 81 frames at 16 fps.
+T5 stays on the GPU by default. Use `--offload-text-encoder` to free its GPU memory
+between prompts; encoding still runs on the GPU and transfers the weights each time.
 For a file with one prompt per line, start one process per GPU:
 
 ```bash

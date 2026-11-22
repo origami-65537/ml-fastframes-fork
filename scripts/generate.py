@@ -22,19 +22,21 @@ from fastframes.pipeline import MODELS, FastFrames, configure_backends  # noqa: 
 from fastframes.video import save_video  # noqa: E402
 
 
-def load_model(name, checkpoint_dir):
+def load_model(name, checkpoint_dir, *, offload_text_encoder=False):
     """Build a released model from ``<checkpoint_dir>`` (see docs/installation.md#checkpoints)."""
     spec = MODELS[name]
     root = Path(checkpoint_dir)
     configure_backends(spec.config)
     return FastFrames.from_pretrained(
-        spec.config, root / spec.wan_dir, root / spec.dit, root / spec.refiner, root / spec.decoder)
+        spec.config, root / spec.wan_dir, root / spec.dit, root / spec.refiner, root / spec.decoder,
+        offload_text_encoder=offload_text_encoder)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", choices=sorted(MODELS), required=True)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
+    parser.add_argument("--offload-text-encoder", action="store_true", help="Keep T5 on CPU between prompts")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--prompt")
     source.add_argument("--prompt-file", type=Path)
@@ -52,7 +54,7 @@ def main():
         out = args.output_dir or Path("outputs") / args.model
         jobs = [(p, args.seed + i, out / f"{i:04d}.mp4") for i, p in enumerate(prompts)][args.shard::args.num_shards]
 
-    model = load_model(args.model, args.checkpoint_dir)
+    model = load_model(args.model, args.checkpoint_dir, offload_text_encoder=args.offload_text_encoder)
     for prompt, seed, path in jobs:
         start = time.perf_counter()
         frames = model.generate(prompt, seed)

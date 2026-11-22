@@ -51,6 +51,65 @@ def test_repeated_image_encoding_moves_vae_back_to_device(monkeypatch):
     assert vae.mock_calls[-1] == call.model.cpu()
 
 
+def test_image_encoding_keeps_resident_vae_in_place(monkeypatch):
+    for name in ("HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH"):
+        monkeypatch.setattr(conditioning, name, 2)
+    vae = Mock()
+    vae.encode.return_value = [torch.zeros(16, 1, 2, 2)]
+    conditioning.image_condition(vae, Image.new("RGB", (2, 2)), 1, torch.device("cpu"), offload=False)
+    assert [entry[0] for entry in vae.mock_calls] == ["encode"]
+
+
+@pytest.mark.parametrize("cpu_encode", [True, False])
+def test_text_context_selects_encoding_device_and_restores_t5(cpu_encode):
+    device = torch.device("cuda:0")
+    raw = Mock()
+    raw.shape = (2, 4)
+    raw.to.return_value = raw
+    encoder = Mock(return_value=[raw])
+    with patch.object(conditioning.torch, "cat"):
+        conditioning.text_context(encoder, "prompt", device, cpu_encode=cpu_encode)
+    encoder.assert_called_once_with(["prompt"], torch.device("cpu") if cpu_encode else device)
+    assert encoder.model.mock_calls == ([] if cpu_encode else [call.to(device), call.cpu()])
+    if cpu_encode:
+        raw.to.assert_called_once_with(device)
+    else:
+        raw.to.assert_not_called()
+        encoder.side_effect = RuntimeError("encode failed")
+        with pytest.raises(RuntimeError, match="encode failed"):
+            conditioning.text_context(encoder, "prompt", device, cpu_encode=False)
+        assert encoder.mock_calls[-1] == call.model.cpu()
+
+
+@pytest.mark.parametrize("world", [1, 8])
+@pytest.mark.parametrize("encode_fails", [False, True])
+def test_start_only_parks_dit_for_single_gpu(world, encode_fails):
+    pipe = pipeline.FastFramesLingBot.__new__(pipeline.FastFramesLingBot)
+    mock = Mock()
+    pipe.device, pipe.world, pipe.prompt = torch.device("cuda:0"), world, None
+    pipe.upstream, pipe.dit = mock.upstream, mock.dit
+    pipe._park_cache, pipe._unpark_cache, pipe.restart = mock.park, mock.unpark, mock.restart
+    if encode_fails:
+        mock.image_condition.side_effect = RuntimeError("encode failed")
+    with (patch.object(pipeline, "image_condition", mock.image_condition),
+          patch.object(pipeline, "text_context", mock.text_context)):
+        if encode_fails:
+            with pytest.raises(RuntimeError, match="encode failed"):
+                pipe.start(mock.image, "prompt", latents=pipeline.CHUNK)
+        else:
+            pipe.start(mock.image, "prompt", latents=pipeline.CHUNK)
+    offload = world == 1
+    expected = [call.text_context(mock.upstream.text_encoder, "prompt", pipe.device, cpu_encode=offload)]
+    if offload:
+        expected.append(call.park())
+    expected.append(call.image_condition(mock.upstream.vae, mock.image, pipeline.CHUNK, pipe.device, offload=offload))
+    if offload:
+        expected.append(call.unpark())
+    if not encode_fails:
+        expected.extend([call.dit.set_context(mock.text_context.return_value), call.restart(seed=0, noise="clip")])
+    assert mock.mock_calls == expected
+
+
 def test_graphs_cleared_before_park():
     pipe = pipeline.FastFramesLingBot.__new__(pipeline.FastFramesLingBot)
     mock = Mock()

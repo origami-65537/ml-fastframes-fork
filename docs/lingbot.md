@@ -17,6 +17,9 @@ On one supported NVIDIA GPU, self-attention defaults to SageAttention when
 it uses cuDNN. Set `LB_ATTN=cudnn` to force cuDNN or `LB_ATTN=sage` to require SageAttention.
 The one-GPU loader enables expandable CUDA allocator segments by default when no PyTorch
 allocator configuration is set. Set `LB_EXPANDABLE_SEGMENTS=0` to disable that default.
+One-GPU conditioning runs T5 on the CPU and parks the DiT and KV cache during VAE
+encoding. Eight-GPU conditioning runs T5 on the GPU for each new prompt and keeps
+the DiT, KV cache and VAE on the GPU, so starting a new world does not discard graphs.
 
 On one GPU, the refiner uses compilation and writes directly to the rolling KV cache
 by default. Set `LB_COMPILE_REFINER=0` to disable refiner compilation (also off with
