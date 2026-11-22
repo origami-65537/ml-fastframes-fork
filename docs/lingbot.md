@@ -34,8 +34,14 @@ Experimental settings (off unless specified):
 |---|---|
 | `LB_FP8=1`, `ffn`, or `attention` | Opt in to dynamically scaled FP8 for the selected DiT linears. Defaults to `0` (BF16). Cross-attention K/V stay BF16. |
 | `LB_ATTN_CROSS=sage` | Use SageAttention for cross-attention on one GPU. |
+| `LB_ATTN=flash` / `LB_ATTN_CROSS=flash` | Force PyTorch FlashAttention for self- or cross-attention, without Sage's INT8 Q/K quantization. Requires a supported CUDA build/GPU and no split-KV. |
+| `LB_ATTN=sage_hnd` / `LB_ATTN_CROSS=sage_hnd` | Try contiguous per-head Q/K/V inside the same SageAttention 1.0.6 kernels. Requires one GPU and head dim 64 or 128. The rolling cache layout is unchanged. |
 | `LB_SAGE_PRECENTER=1` | Center SageAttention keys out of place instead of cloning and then centering. |
 | `LB_REFINER_HEADS_PER_STREAM=N` | Group N DiT layers per refiner CUDA stream; N must divide the layer count. |
+
+Sage HND always centers keys out of place. Neither attention experiment changes
+the default backend selections. Compare each to the current Sage baseline and
+run the video quality gate against the existing BF16/cuDNN reference.
 
 On the RTX 5060 Ti 16 GB fixed benchmark (832 × 464, 77 output frames), all three FP8
 settings failed the quality gate against the BF16/cuDNN reference. Side-by-side frames

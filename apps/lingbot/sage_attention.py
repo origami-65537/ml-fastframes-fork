@@ -18,6 +18,16 @@ def load_sage():
     return sageattn
 
 
+@cache
+def load_sage_hnd():
+    # Use the same pinned v1 kernels while combining the value cast and layout conversion.
+    load_sage()
+    from sageattention.attn_qk_int8_per_block import forward
+    from sageattention.quant_per_block import per_block_int8
+
+    return per_block_int8, forward
+
+
 def use_sage(backend, device, head_dim, *, eligible):
     if backend not in ("auto", "sage") or not eligible:
         return False
@@ -48,3 +58,19 @@ def sage_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
 @sage_attention.register_fake
 def _(query, key, value, precenter=False):
     return torch.empty(query.shape, device=query.device, dtype=query.dtype)
+
+
+@torch.library.custom_op("fastframes_lingbot::sage_attention_hnd", mutates_args=())
+def sage_attention_hnd(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    """Run the Sage v1 kernels with contiguous per-head INT8 Q/K and FP16 V."""
+    quantize, forward = load_sage_hnd()
+    centered = key - key.mean(dim=1, keepdim=True)
+    q, q_scale, k, k_scale = quantize(query.transpose(1, 2), centered.transpose(1, 2),
+                                     sm_scale=query.shape[-1] ** -0.5, tensor_layout="HND")
+    v = value.transpose(1, 2).to(dtype=torch.float16, memory_format=torch.contiguous_format)
+    return forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=query.dtype).transpose(1, 2)
+
+
+@sage_attention_hnd.register_fake
+def _(query, key, value):
+    return torch.empty_like(query.transpose(1, 2), memory_format=torch.contiguous_format).transpose(1, 2)

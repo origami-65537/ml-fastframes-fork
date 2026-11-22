@@ -115,7 +115,8 @@ class FP8Tests(unittest.TestCase):
         runner.dim = runner.head_dim = 16
         runner.local_tokens = runner.end = 2
         runner.start = 0
-        runner.sage_self = runner.sage_cross = runner.sage_precenter = False
+        runner.attn_self = runner.attn_cross = "cudnn"
+        runner.sage_precenter = False
         runner.time_e0 = torch.zeros(1, 1, 6, 16)
         runner.rope = torch.zeros(2, 1, 8, 2)
         runner.rope[..., 0] = 1
