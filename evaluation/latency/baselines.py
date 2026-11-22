@@ -43,6 +43,10 @@ def load_upstream(path):
     sys.path.insert(0, str(path))
     import wan.modules.causal_model as causal_model
     import wan.modules.model as wan_model
+    for module, name in ((causal_model, "attention"), (wan_model, "flash_attention")):
+        if not hasattr(module, name):
+            raise RuntimeError(f"{module.__name__}.{name} not found in {path}; "
+                               "the upstream layout changed, so the cuDNN SDPA patch would not apply")
     causal_model.attention = cudnn_attention
     wan_model.flash_attention = cudnn_attention
     return causal_model.CausalWanModel
