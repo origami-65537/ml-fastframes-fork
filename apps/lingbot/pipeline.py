@@ -136,7 +136,7 @@ class FastFramesLingBot:
         heads_per_stream = int(os.environ.get("LB_REFINER_HEADS_PER_STREAM", model.kv_layers_per_stream[world]))
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
                                  self.timesteps[-1], world=world, rank=rank,
-                                 heads_per_stream=heads_per_stream, direct_kv=env("LB_REFINER_DIRECT_KV", False),
+                                 heads_per_stream=heads_per_stream, direct_kv=env("LB_REFINER_DIRECT_KV", world == 1),
                                  sage_stem=env("LB_REFINER_SAGE_STEM", False),
                                  compile=env("LB_COMPILE_REFINER", compile), graphs=env("LB_GRAPHS_REFINER", graphs))
         self.clean_cache_only = env("LB_DIT_CLEAN_CACHE_ONLY", False)

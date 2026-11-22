@@ -18,18 +18,32 @@ it uses cuDNN. Set `LB_ATTN=cudnn` to force cuDNN or `LB_ATTN=sage` to require S
 The one-GPU loader enables expandable CUDA allocator segments by default when no PyTorch
 allocator configuration is set. Set `LB_EXPANDABLE_SEGMENTS=0` to disable that default.
 
+On one GPU, the refiner uses compilation and writes directly to the rolling KV cache
+by default. Set `LB_COMPILE_REFINER=0` to disable refiner compilation (also off with
+`--eager` unless explicitly enabled) or `LB_REFINER_DIRECT_KV=0` to use staged writes.
+Multi-GPU runs keep staged writes.
+
 Experimental settings (off unless specified):
 
 | Setting | Effect |
 |---|---|
-| `LB_FP8=1`, `ffn`, or `attention` | Use dynamically scaled FP8 for the selected DiT linears. Cross-attention K/V stay BF16. |
+| `LB_FP8=1`, `ffn`, or `attention` | Opt in to dynamically scaled FP8 for the selected DiT linears. Defaults to `0` (BF16). Cross-attention K/V stay BF16. |
 | `LB_ATTN_CROSS=sage` | Use SageAttention for cross-attention on one GPU. |
 | `LB_SAGE_PRECENTER=1` | Center SageAttention keys out of place instead of cloning and then centering. |
 | `LB_SAGE_FP16_V_CACHE=1` | Store self-attention values in the FP16 format Sage v1 consumes to avoid casting the whole cache for each attention call. Require single-GPU SageAttention. |
 | `LB_DIT_CLEAN_CACHE_ONLY=1` | Skip the unused tail of the first chunk's clean DiT pass after writing the last layer's K/V. |
-| `LB_REFINER_DIRECT_KV=1` | Write refinement results directly into the rolling cache on one GPU. |
 | `LB_REFINER_HEADS_PER_STREAM=N` | Group N DiT layers per refiner CUDA stream; N must divide the layer count. |
 | `LB_REFINER_SAGE_STEM=1` | Use SageAttention for the refiner's per-frame stem attention on one GPU. This changes the stem's numerical precision. |
+
+On the RTX 5060 Ti 16 GB fixed benchmark (832 × 464, 77 output frames), all three FP8
+settings failed the quality gate against the BF16/cuDNN reference. Side-by-side frames
+showed trajectory drift around frames 15–25, rather than visible noise or color shifts.
+Keep FP8 off when the fixed-benchmark quality gate must pass.
+
+On the same GPU, DiT denoising graph warmup ran out of memory during the first step of the two-start smoke
+test. Set `LB_GRAPHS_DIT=0` to run DiT without CUDA graphs while keeping DiT compilation
+enabled. With that setting, both starts produced bit-identical first chunks even with
+refiner and decoder graphs left on.
 
 ## Interactive demo (1.3B)
 
