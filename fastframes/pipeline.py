@@ -163,7 +163,7 @@ class FastFrames:
     def encode_prompt(self, prompt: str):
         offload = self.offload_text_encoder and self.device.type != "cpu"
         try:
-            if offload:
+            if offload or self.text_encoder.device != self.device:
                 self.text_encoder.to(self.device)
             with self.autocast():
                 return self.text_encoder([prompt])["prompt_embeds"]
