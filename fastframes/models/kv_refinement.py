@@ -88,12 +88,12 @@ class StemBlock(nn.Module):
             nn.Linear(d_a, d_a * mlp_mult), nn.GELU(approximate="tanh"), nn.Linear(d_a * mlp_mult, d_a))
         self.mod = Modulation(d_a, 6)
 
-    def forward(self, x: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, e: torch.Tensor, *, attend=_sdpa) -> torch.Tensor:
         b, s, _ = x.shape
         sh1, sc1, g1, sh2, sc2, g2 = self.mod(e)
         h = self.norm1(x) * (1 + sc1) + sh1
         q, k, v = self.qkv(h).reshape(b, s, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
-        x = x + g1 * self.proj(_sdpa(q, k, v).transpose(1, 2).reshape(b, s, -1))
+        x = x + g1 * self.proj(attend(q, k, v).transpose(1, 2).reshape(b, s, -1))
         h = self.norm2(x) * (1 + sc2) + sh2
         return x + g2 * self.mlp(h)
 
@@ -207,11 +207,11 @@ class KVRefinementNetwork(nn.Module):
             timestep = timestep.expand(batch_size)
         return self.t_embed(timestep).to(dtype)
 
-    def compute_phi(self, stem_tokens: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+    def compute_phi(self, stem_tokens: torch.Tensor, e: torch.Tensor, *, attend=_sdpa) -> torch.Tensor:
         """stem_tokens: ``[B, S, dim]`` patch-embedded clean latent -> ``[B, S, d_a]``."""
         x = self.stem_in(stem_tokens)
         for block in self.stem_blocks:
-            x = block(x, e)
+            x = block(x, e, attend=attend)
         return self.stem_norm(x)
 
     def repair_all(self, nK_all, nV_all, phi, e):

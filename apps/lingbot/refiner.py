@@ -27,17 +27,23 @@ import torch.nn.functional as F
 
 from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
 from .dit import FRAME_TOKENS, READ_FRAMES, TOKENS, rope_real
+from .sage_attention import sage_attention, use_sage
 
 __all__ = ["KVRefiner"]
+
+
+def _sage_stem_attention(q, k, v):
+    return sage_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), True).transpose(1, 2)
 
 
 class _Stem(torch.nn.Module):
     """``phi_v`` of the chunk (or of this rank's half frame): patch projection -> stem -> ``phi_proj``."""
 
-    def __init__(self, net, patch, timestep, world, rank):
+    def __init__(self, net, patch, timestep, world, rank, sage_stem):
         super().__init__()
         self.net, self.patch, self.world, self.rank = net, patch, world, rank
         self.frames = CHUNK if world == 1 else 1
+        self.sage_stem = sage_stem
         device = next(net.parameters()).device
         self.register_buffer("embedding", net.embed_timestep(timestep, self.frames, device, torch.bfloat16))
         self.phi_proj = net.heads_grouped.phi_proj[str(net.heads_grouped.gemms[0].d_v)]
@@ -52,7 +58,11 @@ class _Stem(torch.nn.Module):
         columns = columns.permute(0, 3, 5, 1, 2, 4).reshape(144, -1)
         stem = (self.patch.weight.flatten(1) @ columns) + self.patch.bias[:, None]
         stem = stem.T.reshape(self.frames, FRAME_TOKENS, -1)
-        phi = self.net.compute_phi(stem, self.embedding).reshape(1, self.frames * FRAME_TOKENS, -1)
+        if self.sage_stem:
+            phi = self.net.compute_phi(stem, self.embedding, attend=_sage_stem_attention)
+        else:
+            phi = self.net.compute_phi(stem, self.embedding)
+        phi = phi.reshape(1, self.frames * FRAME_TOKENS, -1)
         if self.world > 1:
             start = self.rank % 2 * (FRAME_TOKENS // 2)
             phi = phi[:, start:start + FRAME_TOKENS // 2]
@@ -104,13 +114,15 @@ class KVRefiner:
     """
 
     def __init__(self, net, patch, cache_k, cache_v, key, value, timestep, *, world=1, rank=0,
-                 heads_per_stream=None, direct_kv=False, compile=True, graphs=True):
+                 heads_per_stream=None, direct_kv=False, sage_stem=False, compile=True, graphs=True):
         import torch._inductor.config as inductor_config
         inductor_config.emulate_precision_casts = True
         if world not in (1, 8):
             raise ValueError("KV refinement supports 1 or 8 GPUs")
         if direct_kv and world != 1:
             raise ValueError("direct KV refinement requires one GPU")
+        if sage_stem and world != 1:
+            raise ValueError("LB_REFINER_SAGE_STEM requires one GPU")
         layers, dim = net.num_blocks, net.dim
         heads_per_stream = layers if heads_per_stream is None else heads_per_stream
         if heads_per_stream < 1 or layers % heads_per_stream:
@@ -121,12 +133,15 @@ class KVRefiner:
         self.k, self.v = key.view(layers, TOKENS, dim), value.view(layers, TOKENS, dim)
         self.use_graphs, self.graphs = graphs, {}
         device = self.k.device
+        if sage_stem:
+            for block in net.stem_blocks:
+                use_sage("sage", device, block.head_dim, eligible=True)
         self.x = torch.empty(16, CHUNK, LATENT_HEIGHT, LATENT_WIDTH, device=device)
         self.y = torch.empty(20, CHUNK, LATENT_HEIGHT, LATENT_WIDTH, device=device)
         self.rope = torch.empty(TOKENS, 1, net.head_dim // 2, 2, device=device)
         self.count = heads_per_stream
         with torch.autocast("cuda", enabled=False):
-            self.stem_module = _Stem(net, patch, timestep, world, rank)
+            self.stem_module = _Stem(net, patch, timestep, world, rank, sage_stem)
             embedding = net.embed_timestep(timestep, 1, device, torch.bfloat16)
             self.head_modules = [_Heads(net, embedding, lo, lo + self.count) for lo in range(0, layers, self.count)]
 

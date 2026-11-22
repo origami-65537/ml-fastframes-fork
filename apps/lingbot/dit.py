@@ -134,7 +134,7 @@ class DiTResult:
 class LingBotDiT:
     """Chunk-wise evaluation of a ``WanModelFast`` against the rolling KV cache.
 
-    ``cache_k`` / ``cache_v``: ``[layers, 1, 18 * 1508, heads, head_dim]`` BF16, owned by the
+    ``cache_k`` / ``cache_v``: ``[layers, 1, 18 * 1508, heads, head_dim]``, owned by the
     caller (who also evicts frames between chunks). ``timesteps``: the denoising timesteps; the
     last one is the one whose features and K/V are captured.
     """
@@ -151,6 +151,8 @@ class LingBotDiT:
 
         self.sage_self = use_sage(os.environ.get("LB_ATTN", "auto"), self.device, self.head_dim,
                                   eligible=self.world == 1 and self.split_kv == 1)
+        if cache_v.dtype == torch.float16 and not self.sage_self:
+            raise ValueError("LB_SAGE_FP16_V_CACHE requires single-GPU SageAttention self-attention")
         self.sage_cross = use_sage(os.environ.get("LB_ATTN_CROSS", "cudnn"), self.device, self.head_dim,
                                    eligible=self.world == 1)
         self.sage_precenter = os.environ.get("LB_SAGE_PRECENTER") == "1"
@@ -276,17 +278,18 @@ class LingBotDiT:
             self.camera_params[i, 1].copy_(shift)
 
     def _block(self, block, value, cache_k, cache_v, text_k, text_v, cam, qkv_weight, qkv_bias, gathered,
-               captured_k, captured_v, read_frames: int, capture: bool):
+               captured_k, captured_v, read_frames: int, capture: bool, cache_only: bool = False):
         heads, head_dim, tokens = self.heads, self.head_dim, self.local_tokens
         e = (block.modulation.unsqueeze(0) + self.time_e0).unbind(2)
         hidden = layer_norm(value, block.norm1).float() * (1 + e[1]) + e[0]
         a = block.self_attn
         qkv = qkv_weight(hidden) if qkv_bias is None else F.linear(hidden, qkv_weight, qkv_bias)
         query, key, val = qkv.chunk(3, -1)
-        query = rms_norm(query, a.norm_q).view(1, tokens, heads, head_dim)
+        if not cache_only:
+            query = rms_norm(query, a.norm_q).view(1, tokens, heads, head_dim)
+            query = rope_real(query, self.rope[self.start:self.end])
         key = rms_norm(key, a.norm_k).view(1, tokens, heads, head_dim)
         val = val.view(1, tokens, heads, head_dim)
-        query = rope_real(query, self.rope[self.start:self.end])
         if self.world > 1:
             shard, full = gathered
             shard.copy_(torch.cat([key.flatten(2), val.flatten(2)], -1).reshape(tokens, 2 * self.dim))
@@ -301,6 +304,8 @@ class LingBotDiT:
         end = read_frames * FRAME_TOKENS
         cache_k[:, end - TOKENS:end].copy_(physical_key)
         cache_v[:, end - TOKENS:end].copy_(val)
+        if cache_only:
+            return value
         split = self.split_kv if end % self.split_kv == 0 else 1
         attended = attention(query, cache_k[:, :end], cache_v[:, :end], split, sage=self.sage_self,
                              precenter=self.sage_precenter)
@@ -339,13 +344,15 @@ class LingBotDiT:
         output = output.reshape(CHUNK, GRID_H, GRID_W, 1, 2, 2, 16).permute(6, 0, 3, 1, 4, 2, 5)
         self.result.prediction.copy_(output.reshape(16, CHUNK, LATENT_HEIGHT, LATENT_WIDTH).float())
 
-    def _run(self, read_frames, capture):
+    def _run(self, read_frames, capture, cache_only):
         value = self._patch_run()
         for i, block in enumerate(self.model.blocks):
             value = self._block_run(block, value, self.cache_k[i], self.cache_v[i], self.text_k[i], self.text_v[i],
                                     self.camera_params[i], *self.qkv[i], self.gather[i],
-                                    self.result.key[i], self.result.value[i], read_frames, capture)
-        self._post_run(value, capture)
+                                    self.result.key[i], self.result.value[i], read_frames, capture,
+                                    cache_only and i == self.layers - 1)
+        if not cache_only:
+            self._post_run(value, capture)
 
     # ------------------------------------------------------------------ public API
     @torch.no_grad()
@@ -378,13 +385,15 @@ class LingBotDiT:
         return graph
 
     @torch.no_grad()
-    def forward(self, x, timestep, read_frames, *, capture=None):
-        """One evaluation on the staged chunk; ``capture`` defaults to ``timestep == final``."""
+    def forward(self, x, timestep, read_frames, *, capture=None, cache_only=False):
+        """Evaluate the staged chunk. With ``cache_only``, update KV and leave the result untouched."""
         if not self._chunk_staged:
             raise RuntimeError("call begin_chunk first")
         timestep = int(timestep)
         capture = timestep == self.final_timestep if capture is None else bool(capture)
-        key = (int(read_frames), capture)
+        if cache_only and capture:
+            raise ValueError("cache_only is incompatible with capture")
+        key = (int(read_frames), capture, cache_only)
         if key[0] not in READ_FRAMES:
             raise ValueError(f"unsupported cache length {read_frames}")
         self.x.copy_(x)

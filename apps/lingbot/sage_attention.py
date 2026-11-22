@@ -36,13 +36,29 @@ def use_sage(backend, device, head_dim, *, eligible):
     return True
 
 
+@cache
+def _fp16_v_kernels(head_dim):
+    load_sage()
+    from sageattention.core import attn_false, attn_h96_false, per_block_int8, per_block_int8_hd96
+
+    return (per_block_int8_hd96, attn_h96_false) if head_dim == 96 else (per_block_int8, attn_false)
+
+
 @torch.library.custom_op("fastframes_lingbot::sage_attention", mutates_args=())
 def sage_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                    precenter: bool = False) -> torch.Tensor:
     # v1 smooth_k subtracts the key mean in place; never mutate the rolling/text cache.
     prepared = key - key.mean(dim=1, keepdim=True) if precenter else key.clone()
+    scale = query.shape[-1] ** -0.5
+    if value.dtype == torch.float16 and query.dtype != value.dtype:
+        # Mirror Sage v1's noncausal path, bypassing only its full-cache BF16 -> FP16 V cast.
+        if not precenter:
+            prepared.sub_(prepared.mean(dim=1, keepdim=True))
+        quantize, attend = _fp16_v_kernels(query.shape[-1])
+        q, k, q_scale, k_scale = quantize(query, prepared, sm_scale=scale, tensor_layout="NHD")
+        return attend(q, k, value, q_scale, k_scale, tensor_layout="NHD", output_dtype=query.dtype)
     return load_sage()(query, prepared, value, tensor_layout="NHD", is_causal=False, smooth_k=not precenter,
-                       sm_scale=query.shape[-1] ** -0.5)
+                       sm_scale=scale)
 
 
 @sage_attention.register_fake

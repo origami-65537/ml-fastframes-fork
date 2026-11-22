@@ -41,6 +41,36 @@ class SageAttentionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "missing backend"):
                 use_sage("sage", device, 128, eligible=True)
 
+    def test_fp16_v_cache_matches_sage_conversion_and_centering(self):
+        query = torch.randn(1, 7, 2, 64, dtype=torch.bfloat16)
+        key = torch.randn(1, 11, 2, 64, dtype=query.dtype)
+        original = key.clone()
+        value = torch.randn_like(key)
+        fp16_cache = torch.empty_like(value, dtype=torch.float16)
+        fp16_cache[:, :6].copy_(value[:, :6])
+        fp16_cache[:, 6:].copy_(value[:, 6:])
+        centered = key - key.mean(dim=1, keepdim=True)
+
+        def quantize(q, k, *, sm_scale, tensor_layout):
+            self.assertEqual(sm_scale, 64 ** -0.5)
+            self.assertEqual(tensor_layout, "NHD")
+            torch.testing.assert_close(q, query, rtol=0, atol=0)
+            torch.testing.assert_close(k, centered, rtol=0, atol=0)
+            return q, k, None, None
+
+        def attend(q, k, v, q_scale, k_scale, *, tensor_layout, output_dtype):
+            self.assertEqual(tensor_layout, "NHD")
+            self.assertEqual(v.data_ptr(), fp16_cache.data_ptr())
+            torch.testing.assert_close(v, value.to(torch.float16), rtol=0, atol=0)
+            return v[:, :q.shape[1]].to(output_dtype)
+
+        with patch("apps.lingbot.sage_attention._fp16_v_kernels", return_value=(quantize, attend)):
+            compiled = torch.compile(sage_attention, backend="eager", fullgraph=True)
+            for precenter in (False, True):
+                output = compiled(query, key, fp16_cache, precenter)
+                torch.testing.assert_close(output, value[:, :7].to(torch.float16).to(query.dtype))
+        torch.testing.assert_close(key, original, rtol=0, atol=0)
+
     def test_fake_and_empty(self):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
