@@ -131,7 +131,8 @@ class FastFramesLingBot:
         dit.freqs = self.freqs
         shape = (len(dit.blocks), 1, CACHE_FRAMES * FRAME_TOKENS, dit.num_heads, head_dim)
         self.cache_k = torch.zeros(shape, device=self.device, dtype=torch.bfloat16)
-        self.cache_v = torch.zeros_like(self.cache_k)
+        v_dtype = torch.float16 if os.environ.get("LB_SAGE_FP16_V_CACHE") == "1" else torch.bfloat16
+        self.cache_v = torch.zeros_like(self.cache_k, dtype=v_dtype)
         context = torch.zeros(512, 4096, device=self.device, dtype=torch.bfloat16)
         env = lambda name, default: os.environ.get(name, str(int(default))) == "1"  # noqa: E731
         compile_dit = env("LB_COMPILE_DIT", compile)
@@ -144,7 +145,9 @@ class FastFramesLingBot:
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
                                  self.timesteps[-1], world=world, rank=rank,
                                  heads_per_stream=heads_per_stream, direct_kv=env("LB_REFINER_DIRECT_KV", world == 1),
+                                 sage_stem=env("LB_REFINER_SAGE_STEM", False),
                                  compile=env("LB_COMPILE_REFINER", compile), graphs=env("LB_GRAPHS_REFINER", graphs))
+        self.clean_cache_only = env("LB_DIT_CLEAN_CACHE_ONLY", False)
         decoder_cls = CapturedDecoder if world == 1 else SpatialDecoder
         self.decoder = decoder_cls(decoder, compile=env("LB_COMPILE_DECODER", compile),
                                    graphs=env("LB_GRAPHS_DECODER", graphs))
@@ -271,7 +274,7 @@ class FastFramesLingBot:
                 noise = torch.randn(x0.shape, device=self.device, dtype=x0.dtype, generator=self.generator)
                 x = self.scheduler.add_noise(x0, noise, self.schedule[i + 1])
         if chunk == 0:
-            self.dit(x0, 0, read_frames, capture=False)  # clean pass writes the first chunk's cache
+            self.dit(x0, 0, read_frames, capture=False, cache_only=self.clean_cache_only)
         else:
             self.refiner(x0, y, rope, read_frames)
         pixels = self.decoder(result.features, result.embedding)
