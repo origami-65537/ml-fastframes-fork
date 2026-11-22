@@ -169,7 +169,7 @@ class FastFramesLingBot:
         # CUDA graphs retain addresses of weights, the camera buffer and KV storage.
         self.dit.clear_graphs()
         self.refiner.clear_graphs()
-        self.dit.model.cpu()
+        self.dit.move_weights("cpu")
         self.dit.camera_params.data = self.dit.camera_params.data.cpu()
         self.cache_k.data = self.cache_k.data.cpu()
         self.cache_v.data = self.cache_v.data.cpu()
@@ -177,7 +177,7 @@ class FastFramesLingBot:
 
     def _unpark_cache(self):
         self.dit.camera_params.data = self.dit.camera_params.data.to(self.device)
-        self.dit.model.to(self.device)
+        self.dit.move_weights(self.device)
         self.cache_k.data = self.cache_k.data.to(self.device)
         self.cache_v.data = self.cache_v.data.to(self.device)
 

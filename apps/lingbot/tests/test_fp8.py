@@ -47,6 +47,25 @@ class FP8Tests(unittest.TestCase):
                 self.assertEqual(linear(torch.zeros(1, 32)).count_nonzero().item(), 0)
             self.assertEqual(linear(torch.empty(0, 32)).shape, (0, 16))
 
+    def test_diagnostics_isolate_quantized_operands(self):
+        generator = torch.Generator().manual_seed(19)
+        value, weight = (torch.randn(16, 32, generator=generator).to(torch.bfloat16) for _ in range(2))
+        bias = torch.randn(16, generator=generator).to(torch.bfloat16)
+        for rowwise in (True, False):
+            encoded_value, scale_value = quantize(value, rowwise)
+            encoded_weight, scale_weight = quantize(weight, rowwise)
+            roundtrip_value = (encoded_value.float() * scale_value).to(torch.bfloat16)
+            roundtrip_weight = (encoded_weight.float() * scale_weight).to(torch.bfloat16)
+            for mode, x, w in (("weight", value, roundtrip_weight),
+                               ("activation", roundtrip_value, weight),
+                               ("both", roundtrip_value, roundtrip_weight)):
+                with self.subTest(mode=mode, rowwise=rowwise), patch("torch._scaled_mm") as mm:
+                    linear = FP8Linear(weight, bias, rowwise=rowwise, mode=mode)
+                    output = torch.compile(linear, backend="eager", fullgraph=True)(value)
+                    torch.testing.assert_close(output, torch.nn.functional.linear(x, w, bias), rtol=0, atol=0)
+                    self.assertEqual(linear.weight.dtype, torch.bfloat16)
+                    mm.assert_not_called()
+
     def test_real_scaled_mm_exports(self):
         for rowwise in (True, False):
             linear = FP8Linear(torch.zeros(96, 128), torch.zeros(96), rowwise=rowwise)
@@ -55,6 +74,18 @@ class FP8Tests(unittest.TestCase):
                       if isinstance(module, torch.fx.GraphModule))
             self.assertTrue(any(node.target == torch.ops.aten._scaled_mm.default
                                 for graph in graphs for node in graph.nodes))
+
+    def test_direct_input_bypasses_bf16_rounding(self):
+        generator = torch.Generator().manual_seed(31)
+        value, weight = (torch.randn(16, 64, generator=generator) for _ in range(2))
+        default = FP8Linear(weight, None, rowwise=True)
+        direct = FP8Linear(weight, None, rowwise=True, direct_input=True)
+        encoded, scale = quantize(value, rowwise=True)
+        reference = emulated_scaled_mm(encoded, direct.weight.t(), scale_a=scale,
+                                       scale_b=direct.weight_scale.t(), out_dtype=torch.bfloat16)
+        with patch("torch._scaled_mm", emulated_scaled_mm):
+            torch.testing.assert_close(direct(value), reference, rtol=0, atol=0)
+            self.assertFalse(torch.equal(default(value), reference))
 
     def test_unsupported_device(self):
         with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
@@ -87,6 +118,16 @@ class FP8Tests(unittest.TestCase):
                 self.assertEqual(quantize_dit(scoped, scope=scope) is not None, has_attention)
                 self.assertEqual(isinstance(scoped.blocks[0].self_attn.o, FP8Linear), has_attention)
                 self.assertEqual(isinstance(scoped.blocks[0].ffn[0], FP8Linear), has_ffn)
+        with patch("apps.lingbot.fp8.rowwise_supported", return_value=True):
+            scoped = copy.deepcopy(model)
+            self.assertIsNone(quantize_dit(scoped, scope="self_out,cross_q,ffn_down"))
+            selected = scoped.blocks[0]
+            self.assertIsInstance(selected.self_attn.q, nn.Linear)
+            self.assertIsInstance(selected.self_attn.o, FP8Linear)
+            self.assertIsInstance(selected.cross_attn.q, FP8Linear)
+            self.assertIsInstance(selected.cross_attn.o, nn.Linear)
+            self.assertIsInstance(selected.ffn[0], nn.Linear)
+            self.assertIsInstance(selected.ffn[2], FP8Linear)
         weights = [weakref.ref(module.weight) for module in
                    (block.self_attn.q, block.self_attn.k, block.self_attn.v, block.self_attn.o,
                     block.cross_attn.q, block.cross_attn.o, block.ffn[0], block.ffn[2])]

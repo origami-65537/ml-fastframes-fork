@@ -23,6 +23,10 @@ Experimental settings (off unless specified):
 | Setting | Effect |
 |---|---|
 | `LB_FP8=1`, `ffn`, or `attention` | Use dynamically scaled FP8 for the selected DiT linears. Cross-attention K/V stay BF16. |
+| `LB_FP8=self_qkv,self_out,cross_q,cross_out,ffn_up,ffn_down` | Select any subset of the listed projections; unselected projections stay BF16. |
+| `LB_FP8_DIAG=weight`, `activation`, or `both` | Round-trip only the chosen operands through FP8; use BF16 GEMMs. For quality diagnosis, not speed comparisons. The default `scaled` uses native FP8 GEMMs. |
+| `LB_FP8_DIRECT_INPUT=1` | Quantize the original activation instead of rounding it to BF16 first. |
+| `LB_DIT_PACKED_ONLY=1` | Single GPU: retain packed DiT QKV and camera projections instead of also keeping their unused originals. Park those packed weights on CPU during image conditioning. |
 | `LB_ATTN_CROSS=sage` | Use SageAttention for cross-attention on one GPU. |
 | `LB_SAGE_PRECENTER=1` | Center SageAttention keys out of place instead of cloning and then centering. |
 | `LB_REFINER_DIRECT_KV=1` | Write refinement results directly into the rolling cache on one GPU. |

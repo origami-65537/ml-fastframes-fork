@@ -188,7 +188,8 @@ class LingBotDiT:
         if fp8 != "0":
             from .fp8 import quantize_dit
 
-            fp8_qkv = quantize_dit(model, scope=fp8)
+            fp8_qkv = quantize_dit(model, scope=fp8, mode=os.environ.get("LB_FP8_DIAG", "scaled"),
+                                   direct_input=os.environ.get("LB_FP8_DIRECT_INPUT") == "1")
         self.qkv = ([(linear, None) for linear in fp8_qkv] if fp8_qkv is not None else
                     [(torch.cat([b.self_attn.q.weight, b.self_attn.k.weight, b.self_attn.v.weight]),
                       torch.cat([b.self_attn.q.bias, b.self_attn.k.bias, b.self_attn.v.bias]))
@@ -196,6 +197,11 @@ class LingBotDiT:
         self.cam = [(torch.cat([b.cam_scale_layer.weight, b.cam_shift_layer.weight]).contiguous(),
                      torch.cat([b.cam_scale_layer.bias, b.cam_shift_layer.bias]).contiguous())
                     for b in model.blocks]
+        self.packed_only = self.world == 1 and os.environ.get("LB_DIT_PACKED_ONLY") == "1"
+        if self.packed_only:
+            for block in model.blocks:
+                self._drop_packed_sources((block.cam_scale_layer, block.cam_shift_layer))
+                self._drop_packed_sources((block.self_attn.q, block.self_attn.k, block.self_attn.v))
         self.gather = [None] * self.layers
         self.feature_gather = self.output_gather = None
         if self.world > 1:
@@ -230,6 +236,20 @@ class LingBotDiT:
         self._patch_run = compiled(self._patch)
         self._block_run = compiled(self._block)
         self._post_run = compiled(self._post)
+
+    @staticmethod
+    def _drop_packed_sources(projections):
+        for projection in projections:
+            projection.register_parameter("weight", None)
+            projection.register_parameter("bias", None)
+
+    def move_weights(self, device):
+        self.model.to(device)
+        if self.packed_only:
+            for weight, bias in (*self.qkv, *self.cam):
+                if bias is not None:  # FP8 QKV modules already move with self.model.
+                    weight.data = weight.data.to(device)
+                    bias.data = bias.data.to(device)
 
     # ------------------------------------------------------------------ constants
     @torch.no_grad()
