@@ -234,10 +234,17 @@ frames, shape changes and mean luma outside `[0.01,0.99]` fail independently of 
 reference (tune `--constant-eps`, `--min-luma`, `--max-luma` if necessary). Failures
 exit 1; a missing reference warns and exits 0 unless sanity/performance gates fail.
 Optionally use `--max-fps-drop 0.10` to fail a >10% median fps drop against the
-previous same-key history entry. The baseline must be run on the same GPU.
+previous same-key history entry. The baseline must be run on the same GPU. With the
+default 3 repeats the median is fragile, so when this run's or the previous entry's fps
+CV exceeds `--max-fps-cv 0.02` the gate is skipped and the run is printed and recorded
+as LOW-CONFIDENCE (`fps_gate.status`); rerun the condition before trusting the fps.
+LingBot keys also include `timing_scope` ("steps only (start untimed)"): condition
+encoding in `start()` is outside the timed and peak-VRAM windows.
 
 Every timed repeat is checked after its timer stops, then discarded before the
-next generation (only the last video is retained for optional reference saving).
+next generation (only the last video is retained for optional reference saving;
+the previous one is kept just long enough to record `max_abs_diff_vs_previous`, and
+the run's largest value as `repeat_max_abs_diff`, to expose run-to-run nondeterminism).
 Any failed repeat fails the run, with 1-based repeat numbers in failure reasons
 and per-repeat metrics/verdicts under `repeat_quality` in JSON. The legacy top-level
 `quality` table columns describe the last repeat, not the whole run. Existing

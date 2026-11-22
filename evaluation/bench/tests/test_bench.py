@@ -7,8 +7,8 @@ import torch
 
 from evaluation.bench import fixed_bench
 from evaluation.bench.compare import append_history, read_history, table
-from evaluation.bench.fixed_bench import json_safe, parser, workload_key
-from evaluation.bench.profiling import classify, profile_report
+from evaluation.bench.fixed_bench import fps_gate, json_safe, max_abs_diff, parser, workload_key
+from evaluation.bench.profiling import classify, correlation_stages, profile_report
 from evaluation.bench.quality import compare, sanity, verdict
 from evaluation.bench.stages import TimingProxy, annotate_stages, measure_stages, summarize_events
 from evaluation.bench.stats import sample_stats
@@ -65,7 +65,7 @@ def test_every_repeat(monkeypatch, tmp_path, capsys, case):
              "reference": 255-good, "shape": good[:1]}[case]
     videos = iter([first, good])
     monkeypatch.setattr(fixed_bench, "adapter", lambda args:
-                        (lambda: next(videos), lambda: None, good.shape, None, nullcontext))
+                        (lambda: next(videos), lambda: None, good.shape, None, nullcontext, None))
     for name in ("set_device", "synchronize", "reset_peak_memory_stats"):
         monkeypatch.setattr(torch.cuda, name, lambda *args: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -90,6 +90,9 @@ def test_every_repeat(monkeypatch, tmp_path, capsys, case):
     record = read_history(history)[0]
     assert result == int(case != "normal")
     assert len(record["repeat_quality"]) == 2
+    assert record["repeat_quality"][0]["max_abs_diff_vs_previous"] is None
+    if case == "normal":
+        assert record["repeat_max_abs_diff"] == 0
     assert record["repeat_quality"][1]["verdict"] != "fail"
     if case != "normal":
         assert record["repeat_quality"][0]["verdict"] == "fail"
@@ -129,7 +132,11 @@ def test_history(tmp_path):
 
 @pytest.mark.parametrize("name,category", [("flash_fwd", "attention"), ("ampere_gemm", "GEMM"),
                                            ("cudnn_conv", "conv"), ("qk_int8_sv_f8_attn_kernel", "attention"),
-                                           ("quant_per_block_int8_kernel", "attention quant"), ("layer_norm", "norm"),
+                                           ("quant_per_block_int8_kernel", "attention quant"),
+                                           ("mean_scale_fuse_quant_kernel", "attention quant"),
+                                           ("cutlass_fp8_scaled_mm_dequant", "GEMM"), ("dequantize_gemm_fp8", "GEMM"),
+                                           ("triton_red_fused_native_layer_norm_quant", "norm"),
+                                           ("fp8_quant_kernel", "quant"), ("layer_norm", "norm"),
                                            ("triton_fused", "elementwise/triton fused"),
                                            ("Memcpy HtoD", "memcpy"), ("unknown", "other")])
 def test_categories(name, category):
@@ -277,6 +284,27 @@ def test_profile_stages(tmp_path):
     assert "| flash_fwd | 1 | 0.300 ± 0.000 | 75.0% |" in report
 
 
+def test_nested_stages_innermost(tmp_path):
+    def annotation(name, ts, dur, tid=1):
+        return {"cat": "user_annotation", "name": f"bench_stage/{name}", "pid": 1, "tid": tid, "ts": ts, "dur": dur}
+
+    def launch(ts, correlation, tid=1):
+        return {"cat": "cuda_runtime", "name": "cudaLaunchKernel", "pid": 1, "tid": tid, "ts": ts, "dur": 1,
+                "args": {"correlation": correlation}}
+
+    events = [annotation("step", 0, 200), annotation("dit", 0, 100), annotation("dit.begin_chunk", 10, 20),
+              launch(15, 1), launch(50, 2), launch(150, 3), launch(250, 4), launch(15, 5, tid=2)]
+    assert correlation_stages(events) == {1: "dit.begin_chunk", 2: "dit", 3: "step"}
+    trace = tmp_path / "trace.json"
+    trace.write_text(json.dumps({"traceEvents": events + [
+        {"cat": "kernel", "name": f"k{c}", "ts": 300 + 10 * c, "dur": 10, "args": {"correlation": c}}
+        for c in range(1, 6)]}))
+    report = profile_report([trace], [0.001])
+    assert "| dit.begin_chunk | 0.0 ± 0.0 | 20.0% |" in report
+    assert "| step | 0.0 ± 0.0 | 20.0% |" in report
+    assert "| unattributed | 0.0 ± 0.0 | 40.0% |" in report
+
+
 def test_annotate_stages(monkeypatch):
     labels = []
 
@@ -300,10 +328,147 @@ def test_annotate_stages(monkeypatch):
     class Pipe:
         dit, refiner, decoder = Stage(), Stage(), Stage()
 
+        def step(self, x):
+            return self.decoder(self.dit(self.dit.begin_chunk(x)))
+
     monkeypatch.setattr(torch.profiler, "record_function", Record)
     pipe = Pipe()
     original = pipe.dit
     with annotate_stages(pipe):
-        assert pipe.dit.begin_chunk(1) == 10 and pipe.dit(1) == 2 and pipe.decoder(2) == 3
-    assert labels == ["bench_stage/dit.begin_chunk", "bench_stage/dit", "bench_stage/decoder"]
+        assert pipe.step(1) == 12
+    assert labels == ["bench_stage/step", "bench_stage/dit.begin_chunk", "bench_stage/dit", "bench_stage/decoder"]
     assert pipe.dit is original and "begin_chunk" not in vars(original)
+    assert "step" not in vars(pipe) and pipe.step(1) == 12
+
+
+def test_measure_stages_begin_chunk(monkeypatch):
+    class Event:
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, end):
+            return 1
+
+    class Stage:
+        def __call__(self, x):
+            return x
+
+        def begin_chunk(self, x):
+            return x
+
+    class Pipe:
+        dit, refiner, decoder = Stage(), Stage(), Stage()
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    pipe = Pipe()
+    result = measure_stages(pipe, lambda: pipe.dit(pipe.dit.begin_chunk(1)), lambda: 0)
+    assert set(result["stages"]) == {"dit", "dit.begin_chunk"}
+    assert "begin_chunk" not in vars(pipe.dit)
+
+
+def test_fps_gate_and_repeat_diff():
+    steady, noisy = sample_stats([10, 10.1, 10.05]), sample_stats([8, 10, 12])
+    previous = {"fps": steady, "git": {"sha": "abc"}}
+    assert fps_gate(steady, previous, None, 0.02) == {"status": "off"}
+    assert fps_gate(steady, None, 0.1, 0.02) == {"status": "no-previous"}
+    assert fps_gate(steady, previous, 0.1, 0.02)["status"] == "gated"
+    assert fps_gate(noisy, previous, 0.1, 0.02)["status"] == "low-confidence"
+    assert fps_gate(steady, {"fps": noisy, "git": {"sha": "abc"}}, 0.1, 0.02)["status"] == "low-confidence"
+    assert fps_gate(steady, {"fps": {"median": 10}, "git": {"sha": "abc"}}, 0.1, 0.02)["status"] == "gated"
+    a = torch.tensor([[0, 255], [10, 20]], dtype=torch.uint8)
+    b = torch.tensor([[3, 250], [10, 20]], dtype=torch.uint8)
+    assert max_abs_diff(a, b) == 5 and max_abs_diff(b, a) == 5
+    assert max_abs_diff(a, None) is None and max_abs_diff(a, a[:1]) is None
+
+
+def fake_bench(monkeypatch, generate=None, timing_scope=None):
+    video = torch.randint(40, 210, (2, 12, 12, 3), generator=torch.Generator().manual_seed(0), dtype=torch.uint8)
+    monkeypatch.setattr(fixed_bench, "adapter", lambda args: (generate or (lambda: video), lambda: None,
+                                                              video.shape, None, nullcontext, timing_scope))
+    for name in ("set_device", "synchronize", "reset_peak_memory_stats"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "fake CPU test")
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 0)
+
+
+def test_timing_scope_changes_key(monkeypatch, tmp_path):
+    keys = {}
+    for scope in (None, "steps only (start untimed)"):
+        fake_bench(monkeypatch, timing_scope=scope)
+        history = tmp_path / f"{scope is None}.jsonl"
+        fixed_bench.main(["--warmup", "0", "--repeats", "1", "--history", str(history),
+                          "--reference-dir", str(tmp_path / "ref"), "--run-dir", str(tmp_path / "runs")])
+        record = read_history(history)[0]
+        keys[scope] = record["key"]
+        assert record["timing_scope"] == (scope or "full generate()")
+        assert record["config"].get("timing_scope") == scope
+    assert keys[None] != keys["steps only (start untimed)"]
+
+
+@pytest.mark.parametrize("seconds,expected", [([1.0, 1.0, 1.0], "gated"), ([1.0, 1.2, 0.8], "low-confidence")])
+def test_low_confidence_skips_fps_gate(monkeypatch, tmp_path, capsys, seconds, expected):
+    fake_bench(monkeypatch)
+    times = iter([t for s in seconds for t in (0.0, s)])
+    monkeypatch.setattr(fixed_bench.time, "perf_counter", lambda: next(times))
+    history = tmp_path / "history.jsonl"
+    previous = {"key": "test", "git": {"sha": "abc"}, "fps": sample_stats([100.0] * 3)}
+    argv = ["--warmup", "0", "--history", str(history), "--max-fps-drop", "0.1",
+            "--reference-dir", str(tmp_path / "ref"), "--run-dir", str(tmp_path / "runs")]
+    monkeypatch.setattr(fixed_bench, "workload_key", lambda config: "test")
+    append_history(history, previous)
+    result = fixed_bench.main(argv)
+    record = read_history(history)[-1]
+    assert record["fps_gate"]["status"] == expected
+    if expected == "gated":
+        assert result == 1 and any("fps drop" in r for r in record["reasons"])
+    else:
+        assert not any("fps drop" in r for r in record["reasons"])
+        assert "LOW-CONFIDENCE" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fail_start", [False, True])
+def test_lingbot_adapter_start_once(monkeypatch, tmp_path, fail_start):
+    import apps.lingbot.generate as lingbot
+
+    calls = []
+
+    class FakePipe:
+        def start(self, image, prompt, *, seed, latents):
+            calls.append(("start", seed, latents))
+            if fail_start:
+                raise RuntimeError("encode failed")
+
+        def restart(self, *, seed):
+            calls.append(("restart", seed))
+
+        def step(self, rays):
+            calls.append(("step", rays))
+            return torch.zeros(1, 2, 2, 3, dtype=torch.uint8)
+
+        def close(self):
+            calls.append(("close",))
+
+    monkeypatch.setattr(lingbot, "import_upstream", lambda root: None)
+    monkeypatch.setattr(lingbot, "load_pipeline", lambda args, world, rank: FakePipe())
+    monkeypatch.setattr(lingbot, "read_condition", lambda args: ("image", "prompt", lambda chunk: chunk, 2, 7))
+    args = parser().parse_args(["--model", "lingbot-1.3b", "--example", str(tmp_path)])
+    if fail_start:
+        with pytest.raises(RuntimeError, match="encode failed"):
+            fixed_bench.adapter(args)
+        assert calls == [("start", 7, 2 * lingbot.CHUNK), ("close",)]
+        return
+    generate, close, expected, _, _, scope = fixed_bench.adapter(args)
+    assert scope == "steps only (start untimed)"
+    assert expected == (2 * lingbot.CHUNK * 4 - 3, 464, 832, 3)
+    assert calls == [("start", 7, 2 * lingbot.CHUNK)]
+    for _ in range(3):
+        assert generate().shape == (2, 2, 2, 3)
+    assert calls[1:] == [("restart", 7), ("step", 0), ("step", 1)] * 3
+    close()
+    assert calls[-1] == ("close",)

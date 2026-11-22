@@ -38,22 +38,38 @@ class AnnotationProxy:
 
 
 @contextmanager
-def annotate_stages(pipe, prefix="bench_stage/"):
-    """Label each stage call so profiler kernels can be attributed through launch correlation."""
-    import torch
-
+def wrapped_stages(pipe, wrap, step=False):
+    """Replace the stage calls (and dit.begin_chunk, optionally pipe.step) with wrap(target, name)."""
     originals = {name: getattr(pipe, name) for name in STAGES}
+    own_step = vars(pipe).get("step")
     try:
         for name, target in originals.items():
-            setattr(pipe, name, AnnotationProxy(target, prefix + name, torch.profiler.record_function))
+            setattr(pipe, name, wrap(target, name))
         if hasattr(originals["dit"], "begin_chunk"):
             # The camera branch runs in dit.begin_chunk, outside dit's own call.
-            pipe.dit.begin_chunk = AnnotationProxy(originals["dit"].begin_chunk, prefix + "dit.begin_chunk",
-                                                   torch.profiler.record_function)
+            pipe.dit.begin_chunk = wrap(originals["dit"].begin_chunk, "dit.begin_chunk")
+        if step:
+            pipe.step = wrap(pipe.step, "step")
         yield
     finally:
         for name, target in originals.items():
             setattr(pipe, name, target)
+        if step:
+            if own_step is None:
+                vars(pipe).pop("step", None)
+            else:
+                pipe.step = own_step
+
+
+def annotate_stages(pipe, prefix="bench_stage/"):
+    """Label each stage call so profiler kernels can be attributed through launch correlation.
+
+    pipe.step is labelled too; the innermost label wins, so `step` keeps only its own glue kernels.
+    """
+    import torch
+
+    return wrapped_stages(pipe, lambda target, name: AnnotationProxy(target, prefix + name,
+                                                                     torch.profiler.record_function), step=True)
 
 
 def summarize_events(events):
@@ -67,12 +83,12 @@ def summarize_events(events):
 def measure_stages(pipe, generate, chunk):
     import torch
 
-    originals = {name: getattr(pipe, name) for name in STAGES}
     events = []
-    try:
-        for name, target in originals.items():
-            setattr(pipe, name, TimingProxy(target, name, events, chunk,
-                                           lambda: torch.cuda.Event(enable_timing=True)))
+
+    def timed(target, name):
+        return TimingProxy(target, name, events, chunk, lambda: torch.cuda.Event(enable_timing=True))
+
+    with wrapped_stages(pipe, timed):
         torch.cuda.synchronize()
         output = generate()
         torch.cuda.synchronize()
@@ -80,9 +96,7 @@ def measure_stages(pipe, generate, chunk):
         return {"method": "CUDA events outside stage call objects, one extra generation",
                 "stages": summarize_events(events),
                 "scope": "Sum calls per chunk; DiT includes first-chunk clean pass. Refiner omits chunk 0. "
-                         "Excludes start/encoding, dit.begin_chunk, camera rays, scheduler and output conversion. "
+                         "dit.begin_chunk (camera branch) is timed separately from dit. "
+                         "Excludes start/encoding, camera rays, scheduler and output conversion. "
                          "Events bracket warmed graph replay on the current stream, not graph capture bodies. "
                          "Diagnostic overhead is excluded from benchmark fps/VRAM; no stage repeatability claim."}
-    finally:
-        for name, target in originals.items():
-            setattr(pipe, name, target)

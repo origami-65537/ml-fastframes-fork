@@ -7,10 +7,11 @@ from evaluation.bench.stats import sample_stats
 
 CATEGORIES = [
     ("attention", r"attention|attn|flash|sdpa|fmha|sage"),
-    ("attention quant", r"quant"),
+    ("attention quant", r"quant_per_block|quant_per_warp|per_channel_fp8|mean_scale_fuse_quant"),
     ("GEMM", r"gemm|matmul|mma|cutlass"),
     ("conv", r"conv|cudnn"),
     ("norm", r"norm"),
+    ("quant", r"quant"),
     ("memcpy", r"memcpy|memset"),
     ("elementwise/triton fused", r"elementwise|triton|vectorized|pointwise|fused"),
 ]
@@ -33,10 +34,11 @@ def correlation_stages(events):
     for e in events:
         correlation = e.get("args", {}).get("correlation")
         if e.get("cat") in ("cuda_runtime", "cuda_driver") and correlation is not None:
-            stage = next((name for start, stop, name in ranges[(e.get("pid"), e.get("tid"))]
-                          if start <= e["ts"] <= stop), None)
-            if stage:
-                stages[correlation] = stage
+            # Innermost enclosing range wins (latest start, then earliest end), so nested labels beat parents.
+            enclosing = [(start, -stop, name) for start, stop, name in ranges[(e.get("pid"), e.get("tid"))]
+                         if start <= e["ts"] <= stop]
+            if enclosing:
+                stages[correlation] = max(enclosing)[2]
     return stages
 
 
@@ -68,8 +70,12 @@ def trace_stats(trace_path, wall_seconds):
             "tiny": sum(e["dur"] < 10 for e in kernels) / len(kernels) if kernels else 0}
 
 
+def stage_entry(run, name):
+    return run["stages"].get(name, {"total_us": 0, "kernels": {}, "categories": {}})
+
+
 def stage_sections(runs, top=10):
-    names = [name for name in ("dit.begin_chunk", "dit", "refiner", "decoder")
+    names = [name for name in ("dit.begin_chunk", "dit", "refiner", "decoder", "step")
              if any(name in r["stages"] for r in runs)]
     names += sorted({name for r in runs for name in r["stages"]} - set(names) - {"unattributed"})
     names += ["unattributed"] if any("unattributed" in r["stages"] for r in runs) else []
@@ -77,27 +83,28 @@ def stage_sections(runs, top=10):
         return []
     n = len(runs)
     lines = ["", "## Stages (kernels by the bench stage call that launched them)", "",
+             "`step` is pipe.step outside the named stages (KV evict, noise, scheduler math, uint8 output); "
+             "`unattributed` is outside pipe.step (restart, concatenation, copy to host).", "",
              "| Stage | Kernel ms/run ± stdev | Share of GPU kernel time |", "|---|---:|---:|"]
-    get = lambda r, name: r["stages"].get(name, {"total_us": 0, "kernels": {}, "categories": {}})
     for name in names:
-        ms = sample_stats([get(r, name)["total_us"] / 1000 for r in runs])
-        share = sample_stats([get(r, name)["total_us"] / r["total_us"] if r["total_us"] else 0 for r in runs])
+        ms = sample_stats([stage_entry(r, name)["total_us"] / 1000 for r in runs])
+        share = sample_stats([stage_entry(r, name)["total_us"] / r["total_us"] if r["total_us"] else 0 for r in runs])
         lines.append(f"| {name} | {ms['mean']:.1f} ± {ms['stdev']:.1f} | {share['mean']:.1%} |")
     for name in names:
-        total = [get(r, name)["total_us"] for r in runs]
+        total = [stage_entry(r, name)["total_us"] for r in runs]
         lines += ["", f"### {name}: categories (share of stage kernel time, {n} runs)", ""]
         for category in [c[0] for c in CATEGORIES] + ["other"]:
-            share = sample_stats([get(r, name)["categories"].get(category, 0) / t if t else 0
+            share = sample_stats([stage_entry(r, name)["categories"].get(category, 0) / t if t else 0
                                   for r, t in zip(runs, total)])
             if share["mean"] >= 0.001:
                 lines.append(f"- {category}: {share['mean']:.1%}±{share['stdev']:.1%}")
-        kernels = {k for r in runs for k in get(r, name)["kernels"]}
-        stats = {k: sample_stats([get(r, name)["kernels"].get(k, [0, 0])[1] / 1000 for r in runs])
+        kernels = {k for r in runs for k in stage_entry(r, name)["kernels"]}
+        stats = {k: sample_stats([stage_entry(r, name)["kernels"].get(k, [0, 0])[1] / 1000 for r in runs])
                  for k in kernels}
         lines += ["", f"### {name}: top {top} kernels", "",
                   "| Name | Calls/run | Mean ms/run ± stdev | Share of stage |", "|---|---:|---:|---:|"]
         for k in sorted(kernels, key=lambda k: -stats[k]["mean"])[:top]:
-            calls = sum(get(r, name)["kernels"].get(k, [0, 0])[0] for r in runs) / n
+            calls = sum(stage_entry(r, name)["kernels"].get(k, [0, 0])[0] for r in runs) / n
             mean_total = sum(total) / n / 1000
             lines.append(f"| {k.replace('|', '/')[:160]} | {calls:.0f} | {stats[k]['mean']:.3f} ± "
                          f"{stats[k]['stdev']:.3f} | {stats[k]['mean'] / mean_total if mean_total else 0:.1%} |")
