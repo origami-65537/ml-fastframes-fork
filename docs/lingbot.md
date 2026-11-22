@@ -22,7 +22,7 @@ Experimental settings (off unless specified):
 
 | Setting | Effect |
 |---|---|
-| `LB_FP8=1`, `ffn`, or `attention` | Use dynamically scaled FP8 for the selected DiT linears. Cross-attention K/V stay BF16. |
+| `LB_FP8=1`, `ffn`, or `attention` | Opt in to dynamically scaled FP8 for the selected DiT linears. Defaults to `0` (BF16). Cross-attention K/V stay BF16. |
 | `LB_FP8=self_qkv,self_out,cross_q,cross_out,ffn_up,ffn_down` | Select any subset of the listed projections; unselected projections stay BF16. |
 | `LB_FP8_DIAG=weight`, `activation`, or `both` | Round-trip only the chosen operands through FP8; use BF16 GEMMs. For quality diagnosis, not speed comparisons. The default `scaled` uses native FP8 GEMMs. |
 | `LB_FP8_DIRECT_INPUT=1` | Quantize the original activation instead of rounding it to BF16 first. |
@@ -31,6 +31,16 @@ Experimental settings (off unless specified):
 | `LB_SAGE_PRECENTER=1` | Center SageAttention keys out of place instead of cloning and then centering. |
 | `LB_REFINER_DIRECT_KV=1` | Write refinement results directly into the rolling cache on one GPU. |
 | `LB_REFINER_HEADS_PER_STREAM=N` | Group N DiT layers per refiner CUDA stream; N must divide the layer count. |
+
+On the RTX 5060 Ti 16 GB fixed benchmark (832 × 464, 77 output frames), all three FP8
+settings failed the quality gate against the BF16/cuDNN reference. Side-by-side frames
+showed trajectory drift around frames 15–25, rather than visible noise or color shifts.
+Keep FP8 off when the fixed-benchmark quality gate must pass.
+
+On the same GPU, the first DiT graph warmup ran out of memory in the two-start smoke
+test. Set `LB_GRAPHS_DIT=0` to run DiT without CUDA graphs while keeping DiT compilation
+enabled. With that setting, both starts produced bit-identical first chunks even with
+refiner and decoder graphs left on.
 
 ## Interactive demo (1.3B)
 
