@@ -215,7 +215,6 @@ class FastFrames:
             kv_cache[index]["v"][:, start:end].copy_(values[index].reshape(slot.shape).to(slot.dtype))
 
     # ------------------------------------------------------------------ rollout
-    @torch.inference_mode()
     def rollout(self, prompt_embeds, seed, context="refiner"):
         """Latents ``[1, F, 16, h, w]``, decoder features ``[1, F*L, C]`` and modulation ``[1, F, 1, C]``.
 
@@ -224,10 +223,20 @@ class FastFrames:
         after frame 0's clean DiT pass at ``t = 0``; ``"dit"`` runs that clean pass for
         every frame (Causal Forcing++).
         """
+        return self.rollout_frames(prompt_embeds, seed, context)
+
+    def rollout_frames(self, prompt_embeds, seed, context="refiner", *, grad_mode=torch.inference_mode,
+                       prime_last=True):
+        """``rollout`` under the autograd context ``grad_mode``.
+
+        Use ``grad_mode=torch.no_grad`` when the outputs feed training (inference tensors
+        cannot be saved for backward). ``prime_last=False`` skips writing the last frame's
+        cache slot, which no later frame reads.
+        """
         if context not in CONTEXT_MODES:
             raise ValueError(f"context must be one of {CONTEXT_MODES}")
         cfg = self.config
-        with self.autocast():
+        with grad_mode(), self.autocast():
             noise, transition = self._noise(seed)
             text_cache = self.dit.text_cache(prompt_embeds)
             kv_cache = allocate_kv_cache(self.dit, cfg.num_frames, self.frame_tokens, device=self.device)
@@ -244,6 +253,8 @@ class FastFrames:
                 latents[:, frame:frame + 1].copy_(x0)
                 features.append(feature)
                 modulation.append(mod)
+                if not prime_last and frame + 1 == cfg.num_frames:
+                    break
                 if context == "dit" or frame == 0:
                     self._predict(x0, 0.0, frame, text_cache, kv_cache)
                 elif context == "refiner":
