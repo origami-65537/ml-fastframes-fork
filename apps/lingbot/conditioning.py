@@ -29,13 +29,18 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-__all__ = ["HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH", "CHUNK", "DEFAULT_INTRINSICS",
+__all__ = ["HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH", "CHUNK", "LATENT_CHANNELS",
+           "CONDITION_CHANNELS", "PATCH_IN", "PATCH_COLUMNS", "DEFAULT_INTRINSICS",
            "text_context", "image_condition", "latent_count", "Trajectory", "LiveCamera",
            "KeyboardCamera", "ACTIONS"]
 
 HEIGHT, WIDTH = 464, 832
 LATENT_HEIGHT, LATENT_WIDTH = 58, 104
 CHUNK = 4  # latent frames per generation step
+LATENT_CHANNELS = 16  # VAE latent channels
+CONDITION_CHANNELS = 20  # image condition: 4 mask channels + 16 VAE channels
+PATCH_IN = LATENT_CHANNELS + CONDITION_CHANNELS  # DiT patch-embedding input channels
+PATCH_COLUMNS = PATCH_IN * 2 * 2  # one (1, 2, 2) patch flattened
 # fx, fy, cx, cy for 480 x 832 frames (the intrinsics of upstream example 00).
 DEFAULT_INTRINSICS = (502.9116, 503.10812, 415.77786, 239.77779)
 

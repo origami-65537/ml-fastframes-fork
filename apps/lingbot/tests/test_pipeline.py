@@ -32,6 +32,11 @@ def test_cache_frames_must_keep_sink_frames():
         pipeline._check_cache_frames(minimum - 1)
 
 
+def test_patch_channel_layout():
+    assert (conditioning.LATENT_CHANNELS, conditioning.CONDITION_CHANNELS) == (16, 20)
+    assert (conditioning.PATCH_IN, conditioning.PATCH_COLUMNS) == (36, 144)
+
+
 def test_repeated_image_encoding_moves_vae_back_to_device(monkeypatch):
     for name in ("HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH"):
         monkeypatch.setattr(conditioning, name, 2)
