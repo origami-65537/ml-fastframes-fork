@@ -100,6 +100,11 @@ def load_decoder(path, config, device):
     return net.to(device, dtype=torch.bfloat16).eval().requires_grad_(False)
 
 
+def _check_cache_frames(cache_frames):
+    if cache_frames < SINK_FRAMES + CHUNK:
+        raise ValueError(f"LB_CACHE_FRAMES must be at least {SINK_FRAMES + CHUNK} (sink frames + one chunk)")
+
+
 class FastFramesLingBot:
     """One session at a time; under context parallelism every rank makes the same calls."""
 
@@ -107,6 +112,7 @@ class FastFramesLingBot:
                  graphs=True):
         if world not in (1, 8):
             raise ValueError("FastFrames-LingBot runs on 1 or 8 GPUs")
+        _check_cache_frames(CACHE_FRAMES)
         self.model, self.upstream, self.world, self.rank = model, upstream, world, rank
         dit = upstream.dit
         self.device = dit.patch_embedding.weight.device
@@ -128,14 +134,16 @@ class FastFramesLingBot:
         self.cache_v = torch.zeros_like(self.cache_k)
         context = torch.zeros(512, 4096, device=self.device, dtype=torch.bfloat16)
         env = lambda name, default: os.environ.get(name, str(int(default))) == "1"  # noqa: E731
+        compile_dit = env("LB_COMPILE_DIT", compile)
         self.dit = LingBotDiT(dit, self.cache_k, self.cache_v, context, self.timesteps, world=world, rank=rank,
-                              split_kv=model.split_kv[world], compile=env("LB_COMPILE_DIT", compile),
-                              graphs=env("LB_GRAPHS_DIT", graphs))
+                              split_kv=model.split_kv[world], compile=compile_dit,
+                              graphs=env("LB_GRAPHS_DIT", graphs and world != 1),
+                              camera_sliced=env("LB_DIT_CAMERA_SLICED", compile_dit and world == 1))
         result = self.dit.result
         heads_per_stream = int(os.environ.get("LB_REFINER_HEADS_PER_STREAM", model.kv_layers_per_stream[world]))
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
                                  self.timesteps[-1], world=world, rank=rank,
-                                 heads_per_stream=heads_per_stream, direct_kv=env("LB_REFINER_DIRECT_KV", False),
+                                 heads_per_stream=heads_per_stream, direct_kv=env("LB_REFINER_DIRECT_KV", world == 1),
                                  compile=env("LB_COMPILE_REFINER", compile), graphs=env("LB_GRAPHS_REFINER", graphs))
         decoder_cls = CapturedDecoder if world == 1 else SpatialDecoder
         self.decoder = decoder_cls(decoder, compile=env("LB_COMPILE_DECODER", compile),

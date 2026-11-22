@@ -49,6 +49,7 @@ Example component timings for **FastFrames-S, 1 GPU, 480p**, with a full KV cach
 | **Total** | | | **35.4 ms** (paper: 36 ms) |
 
 See the [profiling guide](docs/inference.md#profiling) for details and baselines.
+For a per-change fps/VRAM/quality guard and kernel speedup hints, see the [fixed benchmark guard](docs/inference.md#fixed-benchmark-guard).
 
 ## Interactive Demo with LingBot
 

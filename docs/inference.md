@@ -192,6 +192,101 @@ delete `temporal_filter_contract.json`, `filtered_temporal/` and `vbench_results
 before scoring again. Recompute aggregates with
 `uv run python evaluation/vbench/summarize.py --from-summary "$RUN/score_summary.json"`.
 
+### Fixed benchmark guard
+
+On a single CUDA GPU, save a lossless reference at the baseline commit, then run
+the same command without `--save-reference` after each change:
+
+```bash
+python evaluation/bench/fixed_bench.py --model ff-s --save-reference
+python evaluation/bench/fixed_bench.py --model ff-s
+python evaluation/bench/fixed_bench.py --model ff-s --profile
+python evaluation/bench/fixed_bench.py --model ff-s --warmup 2 --repeats 10 --profile --profile-repeats 3
+python evaluation/bench/compare.py
+# Alternative workload (upstream example 00 by default):
+python evaluation/bench/fixed_bench.py --model lingbot-1.3b --lingbot-root "$LINGBOT_WORLD_ROOT" --save-reference
+python evaluation/bench/fixed_bench.py --model lingbot-1.3b --lingbot-root "$LINGBOT_WORLD_ROOT" --stage-timing
+```
+
+FastFrames-S uses 832x480, 81 frames, seed 0 and a fixed corgi prompt. LingBot uses
+its example prompt (override with `--prompt`) and rounds `--frames 81` down to
+whole chunks: normally 77 frames at 832x464. Actual shapes are recorded and checked.
+Use identical model weights, software, GPU and settings when comparing results.
+This is an explicit per-change command, not an automatically installed CI job.
+No GPU generation was validated on the CPU-only development VM; 16GB feasibility
+depends on model/runtime memory and is not guaranteed (especially LingBot).
+
+Two untimed warm-ups (`--warmup`, nonnegative) precede ten synchronized end-to-end
+generations (`--repeats`, positive), including CPU output transfer. Reports include
+all samples, median/mean/sample-stdev/min/max/CV for fps and ms per frame, and peak
+allocated/reserved **decimal GB**. History is appended to `outputs/bench/history.jsonl`;
+full JSON records and optional trace/profile reports are under `outputs/bench/runs/`.
+Use `--history`, `--run-dir`, and `--reference-dir` to relocate artifacts.
+References are uint8 `.pt` tensors with a viewing-only MP4; keys include model,
+resolved prompt, seed, requested frames and example path. Do not overwrite a
+baseline reference on candidate commits. Reference creation refuses invalid video.
+
+Every frame must meet `--min-psnr 30`, `--min-ssim 0.90`, and, when the optional
+`lpips` package is installed, `--max-lpips 0.10`. LPIPS may download AlexNet weights
+on first use. Metrics report mean/min/max and per-frame values; infinite PSNR is
+serialized as the string `"inf"` for standards-compliant JSON. Constant/non-finite
+frames, shape changes and mean luma outside `[0.01,0.99]` fail independently of a
+reference (tune `--constant-eps`, `--min-luma`, `--max-luma` if necessary). Failures
+exit 1; a missing reference warns and exits 0 unless sanity/performance gates fail.
+Optionally use `--max-fps-drop 0.10` to fail a >10% median fps drop against the
+latest same-key history entry whose fps CV is at most `--max-fps-cv 0.02`. The
+baseline must be run on the same GPU. With the default 3 repeats the median is
+fragile, so a run whose fps CV exceeds the threshold skips the gate, is printed and
+recorded as LOW-CONFIDENCE (`fps_gate.status`), and is never used as a later
+baseline; rerun the condition before trusting the fps. LingBot history keys also
+include `timing_scope` ("steps only (start untimed)"): condition encoding in
+`start()` is outside the timed and peak-VRAM windows. Reference files use the key
+without `timing_scope` (`reference_key`), so references saved before it still load;
+a reference saved under the timing-scoped key is used when no `reference_key` file exists.
+
+Every timed repeat is checked after its timer stops, then discarded before the
+next generation (only the last video is retained for optional reference saving;
+the previous one is kept just long enough to record `max_abs_diff_vs_previous`, and
+the run's largest value as `repeat_max_abs_diff`, to expose run-to-run nondeterminism).
+Any failed repeat fails the run, with 1-based repeat numbers in failure reasons
+and per-repeat metrics/verdicts under `repeat_quality` in JSON. The legacy top-level
+`quality` table columns describe the last repeat, not the whole run. Existing
+references are compared on every repeat even with `--save-reference`; replacement
+is refused if any repeat fails. Quality checks are outside generation wall timing
+but add CPU work between trials. Empty output fails quality and reports zero
+fps/ms-per-frame for that invalid sample rather than dividing by zero.
+
+`--profile` runs three extra generations in separate profiler sessions
+(`--profile-repeats N`), exporting `trace_00.json`, etc. `profile.md` aggregates
+kernel calls and mean±sample-stdev ms/run (absent kernels count as zero), category
+mean±stdev percentages, union-of-GPU-intervals/wall busy ratio and idle variance.
+The JSON record links every trace and records profiler wall-time samples.
+CV means sample stdev / absolute mean (zero for all-zero samples); singleton
+stdev is reported as zero but does not establish repeatability. Old history
+entries without new statistics display `-` for missing fields.
+
+Hints cite their measured mean, stdev, CV and run count. Thresholds remain
+attention >40% of GPU time, idle >15% of wall time, copies >5% of GPU time, or over
+half of kernels <10 microseconds. A hint is **low-confidence** if its measurement
+has CV >5% or only one run. Missing GPU events suppress hints rather than imply
+CPU bottlenecks. Categories are name-based classifications of measured kernel
+durations, not estimated performance; recommendations are hypotheses, not measured
+speedups. Profiler overhead can exaggerate idle time.
+
+`--stage-timing` (LingBot only) runs one additional diagnostic generation after
+timing/profiling, with CUDA-event proxies around `pipe.dit`, `pipe.refiner` and
+`pipe.decoder` call objects. It prints and records median **summed ms/chunk** and
+all chunk samples. DiT includes its first-chunk clean pass; the refiner has no
+chunk-0 sample. Events bracket the outer, already-warmed call/graph replay, not
+captured graph bodies. Current single-GPU implementations enqueue replay on the
+current stream. Compilation/capture should already be warmed by the timed runs.
+No application code is patched and proxies are restored even on failure.
+These measurements exclude camera rays, `dit.begin_chunk`, encoding in `start`,
+scheduler work and output conversion; they are not a complete stage decomposition
+or a repeatability claim. Event instrumentation runs separately to avoid changing
+benchmark fps/VRAM. CUDA-event timing is implemented but **not GPU-validated on this
+CPU-only VM**; graph replay/device behavior must be validated on the target GPU.
+
 ### Results (Table 1)
 
 | Model | Total | Quality | Semantic |

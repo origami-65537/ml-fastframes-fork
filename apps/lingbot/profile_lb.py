@@ -2,7 +2,7 @@
 """Stage-by-stage VRAM/latency profile for FastFrames-LingBot on 16GB."""
 import os, sys, time
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path[0] = str(Path(__file__).resolve().parents[2])  # repository root, not this directory
 import numpy as np
 import torch
 from PIL import Image
@@ -11,7 +11,6 @@ from apps.lingbot.conditioning import CHUNK, Trajectory
 from apps.lingbot.pipeline import FastFramesLingBot, configure_backends
 from apps.lingbot.upstream import import_upstream
 from apps.lingbot.generate import OFFICIAL, SHARED_ASSETS
-from fastframes.video import save_video
 
 torch.cuda.set_device(0)
 import_upstream("upstream/lingbot-world-v2")
@@ -86,6 +85,4 @@ vram("after chunks")
 print(f"median chunk: {sorted(lat)[len(lat)//2]*1000:.0f}ms  "
       f"-> {4/sorted(lat)[len(lat)//2]*4:.1f} px frames/s")
 
-t0 = time.perf_counter()
-video = torch.cat([f for f in [pipe.step(traj.rays(0))] ]).cpu() if False else None
 pipe.close()
