@@ -144,6 +144,18 @@ class CausalWanAttentionBlock(WanAttentionBlock):
             return self.forward_frame_train(*args, frame=frame, **kwargs)
         return self.forward_train(*args, **kwargs)
 
+    def _modulate_in(self, x, e, num_frames, tokens):
+        """Per-frame adaLN parameters ``e`` (6 chunks) and the modulated self-attn input."""
+        e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
+        return e, (self.norm1(x).unflatten(1, (num_frames, tokens)) * (1 + e[1]) + e[0]).flatten(1, 2)
+
+    def _finish(self, x, y, e, num_frames, tokens, context, cross_kv=None):
+        """Gated self-attn residual ``y``, text cross-attention, and gated FFN residual."""
+        x = x + (y.unflatten(1, (num_frames, tokens)) * e[2]).flatten(1, 2)
+        x = x + self.cross_attn(self.norm3(x), context, cache=cross_kv)
+        y = self.ffn((self.norm2(x).unflatten(1, (num_frames, tokens)) * (1 + e[4]) + e[3]).flatten(1, 2))
+        return x + (y.unflatten(1, (num_frames, tokens)) * e[5]).flatten(1, 2)
+
     def forward_train(self, x, e, grid_sizes, freqs, context, block_mask, teacher_forcing=False, return_kv=False):
         """Full sequence ``[B, F*L, C]`` under ``block_mask``; ``e``: ``[B, F, 6, C]``.
 
@@ -151,8 +163,7 @@ class CausalWanAttentionBlock(WanAttentionBlock):
         of the whole clip, computed with the dynamic-shape attention kernel.
         """
         num_frames, tokens = e.shape[1], x.shape[1] // e.shape[1]
-        e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-        h = (self.norm1(x).unflatten(1, (num_frames, tokens)) * (1 + e[1]) + e[0]).flatten(1, 2)
+        e, h = self._modulate_in(x, e, num_frames, tokens)
         sa = self.self_attn
         q, k, v = sa.qkv(h)
         if teacher_forcing:
@@ -172,10 +183,7 @@ class CausalWanAttentionBlock(WanAttentionBlock):
         else:
             y = _compiled_flex_attention()(*(u.transpose(2, 1) for u in padded), block_mask=block_mask)
         y = sa.o(y[:, :, :length].transpose(2, 1).flatten(2))
-        x = x + (y.unflatten(1, (num_frames, tokens)) * e[2]).flatten(1, 2)
-        x = x + self.cross_attn(self.norm3(x), context)
-        y = self.ffn((self.norm2(x).unflatten(1, (num_frames, tokens)) * (1 + e[4]) + e[3]).flatten(1, 2))
-        x = x + (y.unflatten(1, (num_frames, tokens)) * e[5]).flatten(1, 2)
+        x = self._finish(x, y, e, num_frames, tokens, context)
         return (x, k, v) if return_kv else x
 
     def forward_frame_train(self, x, e, grid_sizes, freqs, context, context_kv, frame):
@@ -184,8 +192,7 @@ class CausalWanAttentionBlock(WanAttentionBlock):
         ``< frame`` (or ``None``). Returns the block output and this frame's (k, v).
         """
         tokens = x.shape[1]
-        e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-        h = (self.norm1(x).unflatten(1, (1, tokens)) * (1 + e[1]) + e[0]).flatten(1, 2)
+        e, h = self._modulate_in(x, e, 1, tokens)
         sa = self.self_attn
         q, k, v = sa.qkv(h)
         q = causal_rope_apply(q, grid_sizes, freqs, start_frame=frame).type_as(v)
@@ -193,17 +200,13 @@ class CausalWanAttentionBlock(WanAttentionBlock):
         keys, values = (k, v) if not context_kv else (torch.cat([*context_kv[0], k], dim=1),
                                                        torch.cat([*context_kv[1], v], dim=1))
         y = sa.o(attention(q, keys, values).flatten(2))
-        x = x + (y.unflatten(1, (1, tokens)) * e[2]).flatten(1, 2)
-        x = x + self.cross_attn(self.norm3(x), context)
-        y = self.ffn((self.norm2(x).unflatten(1, (1, tokens)) * (1 + e[4]) + e[3]).flatten(1, 2))
-        return x + (y.unflatten(1, (1, tokens)) * e[5]).flatten(1, 2), k, v
+        return self._finish(x, y, e, 1, tokens, context), k, v
 
     def forward_frame(self, x, e, grid_sizes, freqs, cross_kv, kv_cache, frame, fast=None, layer=0):
         """One latent frame. ``e``: ``[B, 1, 6, C]``; writes this frame's K/V into ``kv_cache``."""
         tokens = x.shape[1]
         start, end = frame * tokens, (frame + 1) * tokens
-        e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-        h = (self.norm1(x).unflatten(1, (1, tokens)) * (1 + e[1]) + e[0]).flatten(1, 2)
+        e, h = self._modulate_in(x, e, 1, tokens)
         sa = self.self_attn
         shape = (x.shape[0], tokens, sa.num_heads, sa.head_dim)
         if fast is None:
@@ -218,10 +221,7 @@ class CausalWanAttentionBlock(WanAttentionBlock):
         kv_cache["k"][:, start:end].copy_(k)
         kv_cache["v"][:, start:end].copy_(v)
         y = sa.o(attention(q, kv_cache["k"][:, :end], kv_cache["v"][:, :end]).flatten(2))
-        x = x + (y.unflatten(1, (1, tokens)) * e[2]).flatten(1, 2)
-        x = x + self.cross_attn(self.norm3(x), None, cache=cross_kv)
-        y = self.ffn((self.norm2(x).unflatten(1, (1, tokens)) * (1 + e[4]) + e[3]).flatten(1, 2))
-        return x + (y.unflatten(1, (1, tokens)) * e[5]).flatten(1, 2)
+        return self._finish(x, y, e, 1, tokens, None, cross_kv=cross_kv)
 
 
 class CausalHead(Head):
