@@ -4,7 +4,8 @@ import pytest
 import torch
 from PIL import Image
 
-from apps.lingbot import conditioning, pipeline, refiner
+from apps.lingbot import conditioning, dit, pipeline, refiner
+from fastframes.models.kv_refinement import KVRefinementNetwork
 
 
 @pytest.mark.parametrize("allocator_env", [None, "PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"])
@@ -54,6 +55,44 @@ def test_graphs_cleared_before_park():
     assert mock.mock_calls == [call.dit.clear_graphs(), call.refiner.clear_graphs(), call.dit.model.cpu()]
 
 
+@torch.no_grad()
+def test_sliced_camera_matches_full_bank_and_tracks_storage(monkeypatch):
+    for name, size in (("CHUNK", 2), ("GRID_H", 1), ("GRID_W", 2), ("TOKENS", 4)):
+        monkeypatch.setattr(dit, name, size)
+    runner = dit.LingBotDiT.__new__(dit.LingBotDiT)
+    m = runner.model = torch.nn.Module()
+    m.patch_embedding_wancamctrl = torch.nn.Linear(384 * 4, 8)
+    m.c2ws_hidden_states_layer1 = torch.nn.Linear(8, 8)
+    m.c2ws_hidden_states_layer2 = torch.nn.Linear(8, 8)
+    m.blocks = torch.nn.ModuleList(torch.nn.Module() for _ in range(3))
+    for block in m.blocks:
+        block.cam_injector_layer1 = torch.nn.Linear(8, 8)
+        block.cam_injector_layer2 = torch.nn.Linear(8, 8)
+    runner.cam = [(torch.randn(16, 8), torch.randn(16)) for _ in m.blocks]
+    runner.start, runner.end = 1, 3
+    runner.camera = torch.randn(1, 384, 2, 2, 4, dtype=torch.bfloat16)
+    runner.camera_params = torch.empty(3, 2, 1, 2, 8, dtype=torch.bfloat16)
+    runner._camera_project_run = torch.compile(runner._project_camera, backend="aot_eager", fullgraph=True)
+    write_layer = torch.compile(dit._write_camera_layer, backend="aot_eager", fullgraph=True)
+    destinations = []
+
+    def write_slice(camera, block, params, dst):
+        destinations.append(dst)
+        write_layer(camera, block, params, dst)
+
+    runner._camera_layer_run = write_slice
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        runner._prepare_camera()
+        old_storage = runner.camera_params.detach()
+        expected = old_storage.clone()
+        runner.camera_params.data = torch.zeros_like(old_storage)
+        runner._prepare_camera_sliced()
+    assert [dst.data_ptr() for dst in destinations] == [layer.data_ptr() for layer in runner.camera_params]
+    assert [dst.numel() for dst in destinations] == [expected[0].numel()] * len(m.blocks)
+    torch.testing.assert_close(old_storage, expected, rtol=0, atol=0)
+    torch.testing.assert_close(runner.camera_params, expected, rtol=0, atol=0)
+
+
 def test_direct_refiner_commit_matches_staged_commit(monkeypatch):
     monkeypatch.setattr(refiner, "TOKENS", 4)
     monkeypatch.setattr(refiner, "FRAME_TOKENS", 2)
@@ -78,6 +117,38 @@ def test_direct_refiner_commit_matches_staged_commit(monkeypatch):
     r.cache_v.zero_()
     r.local = None
     r.direct_kv = True
+    r.epilogue = None
     run_heads()
+    torch.testing.assert_close(r.cache_k, expected_k, rtol=0, atol=0)
+    torch.testing.assert_close(r.cache_v, expected_v, rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_refiner_epilogue_matches_unfused_direct_write(monkeypatch):
+    monkeypatch.setattr(refiner, "TOKENS", 4)
+    monkeypatch.setattr(refiner, "FRAME_TOKENS", 2)
+    net = KVRefinementNetwork(8, 2, 4, 3, d_a=8).to(torch.bfloat16)
+    group = net.heads_grouped.gemms[0]
+    group.dK_w.normal_(std=0.02)
+    group.dV_w.normal_(std=0.02)
+    group.v_logscale.normal_(std=0.1)
+    r = refiner.KVRefiner.__new__(refiner.KVRefiner)
+    r.local_tokens = 4
+    r.cache_k = torch.zeros(3, 1, 8, 2, 4, dtype=torch.bfloat16)
+    r.cache_v = torch.zeros_like(r.cache_k)
+    r.k, r.v = (torch.randn(3, 4, 8, dtype=torch.bfloat16) for _ in range(2))
+    r.rope = torch.randn(4, 1, 2, 2)
+    r.direct_kv = True
+    r.write_key = refiner._write_refined_key
+    r.epilogue = None
+    head = refiner._Heads(net, torch.randn(1, 8, dtype=torch.bfloat16), 1, 3)
+    phi = torch.randn(4, 8, dtype=torch.bfloat16)
+    r._refine(head, 1, 3, phi, 0, 4, 3)
+    expected_k, expected_v = r.cache_k.clone(), r.cache_v.clone()
+    r.cache_k.zero_()
+    r.cache_v.zero_()
+    r.epilogue = tuple(torch.compile(fn, backend="aot_eager", fullgraph=True)
+                       for fn in (refiner._write_updated_key, refiner._write_updated_value))
+    r._refine(head, 1, 3, phi, 0, 4, 3)
     torch.testing.assert_close(r.cache_k, expected_k, rtol=0, atol=0)
     torch.testing.assert_close(r.cache_v, expected_v, rtol=0, atol=0)

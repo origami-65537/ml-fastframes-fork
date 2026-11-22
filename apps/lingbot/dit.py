@@ -98,6 +98,16 @@ def layer_norm(value, module):
     return F.layer_norm(value.float(), (value.shape[-1],), weight, bias, module.eps).to(value.dtype)
 
 
+def _camera_modulation(camera, block, modulation):
+    hidden = block.cam_injector_layer2(F.silu(block.cam_injector_layer1(camera))) + camera
+    return F.linear(hidden, *modulation)
+
+
+def _write_camera_layer(camera, block, modulation, destination):
+    params = _camera_modulation(camera, block, modulation)
+    destination.copy_(params.unflatten(-1, (2, destination.shape[-1])).movedim(-2, 0))
+
+
 def attention(query, key, value, split=1, sage=False, precenter=False):
     """``query [1, Q, H, D]`` over ``key, value [1, K, H, D]`` with cuDNN; exact split-KV merge."""
     if sage and split == 1:
@@ -226,7 +236,12 @@ class LingBotDiT:
             if not compile:
                 return fn
             return torch.compile(fn, dynamic=False, fullgraph=True, mode="max-autotune-no-cudagraphs")
-        self._camera_run = compiled(self._prepare_camera)
+        if compile and os.environ.get("LB_DIT_CAMERA_SLICED") == "1":
+            self._camera_project_run = compiled(self._project_camera)
+            self._camera_layer_run = compiled(_write_camera_layer)
+            self._camera_run = self._prepare_camera_sliced
+        else:
+            self._camera_run = compiled(self._prepare_camera)
         self._patch_run = compiled(self._patch)
         self._block_run = compiled(self._block)
         self._post_run = compiled(self._post)
@@ -263,17 +278,25 @@ class LingBotDiT:
         patch = self.model.patch_embedding
         return F.linear(tokens[:, self.start:self.end], patch.weight.reshape(self.dim, -1), patch.bias)
 
-    def _prepare_camera(self):
+    def _project_camera(self):
         m = self.model
         camera = self.camera.reshape(1, 384, CHUNK, GRID_H, 2, GRID_W, 2).permute(0, 2, 3, 5, 1, 4, 6)
         camera = camera.reshape(1, TOKENS, 384 * 4)[:, self.start:self.end]
         camera = m.patch_embedding_wancamctrl(camera)
-        camera = camera + m.c2ws_hidden_states_layer2(F.silu(m.c2ws_hidden_states_layer1(camera)))
-        for i, block in enumerate(m.blocks):
-            hidden = block.cam_injector_layer2(F.silu(block.cam_injector_layer1(camera))) + camera
-            scale, shift = F.linear(hidden, *self.cam[i]).chunk(2, -1)
+        return camera + m.c2ws_hidden_states_layer2(F.silu(m.c2ws_hidden_states_layer1(camera)))
+
+    def _prepare_camera(self):
+        camera = self._project_camera()
+        for i, block in enumerate(self.model.blocks):
+            scale, shift = _camera_modulation(camera, block, self.cam[i]).chunk(2, -1)
             self.camera_params[i, 0].copy_(scale)
             self.camera_params[i, 1].copy_(shift)
+
+    def _prepare_camera_sliced(self):
+        camera = self._camera_project_run()
+        for i, block in enumerate(self.model.blocks):
+            # Pass only the layer slice across the compile boundary, not the shared bank.
+            self._camera_layer_run(camera, block, self.cam[i], self.camera_params[i])
 
     def _block(self, block, value, cache_k, cache_v, text_k, text_v, cam, qkv_weight, qkv_bias, gathered,
                captured_k, captured_v, read_frames: int, capture: bool):

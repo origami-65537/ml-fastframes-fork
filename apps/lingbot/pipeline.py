@@ -136,6 +136,7 @@ class FastFramesLingBot:
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
                                  self.timesteps[-1], world=world, rank=rank,
                                  heads_per_stream=heads_per_stream, direct_kv=env("LB_REFINER_DIRECT_KV", False),
+                                 fused_epilogue=env("LB_REFINER_FUSED_EPILOGUE", False),
                                  compile=env("LB_COMPILE_REFINER", compile), graphs=env("LB_GRAPHS_REFINER", graphs))
         decoder_cls = CapturedDecoder if world == 1 else SpatialDecoder
         self.decoder = decoder_cls(decoder, compile=env("LB_COMPILE_DECODER", compile),
