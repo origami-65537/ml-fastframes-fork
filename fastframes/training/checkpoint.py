@@ -99,20 +99,24 @@ def full_state_dict(model):
     return get_model_state_dict(model, options=options)
 
 
+def save_safetensors_atomic(path, tensors):
+    """Write ``tensors`` (contiguous CPU copies) to ``path`` via a temporary file and ``os.replace``."""
+    from safetensors.torch import save_file
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    save_file({k: v.detach().cpu().contiguous() for k, v in tensors.items()}, str(tmp))
+    os.replace(tmp, path)
+
+
 def export_weights(path, model, dtype=None, is_main=True):
     """Save the (EMA-swapped, if desired) model weights as one safetensors file."""
-    from safetensors.torch import save_file
     state = full_state_dict(model)
     error = None
     if is_main:
         try:
-            path = Path(path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            state = {k: (v.to(dtype) if dtype is not None and v.is_floating_point() else v).contiguous()
-                     for k, v in state.items()}
-            tmp = path.with_suffix(".tmp")
-            save_file(state, str(tmp))
-            os.replace(tmp, path)
+            save_safetensors_atomic(path, {k: v.to(dtype) if dtype is not None and v.is_floating_point() else v
+                                           for k, v in state.items()})
         except Exception as exc:  # noqa: BLE001 - reported collectively
             error = exc
     raise_if_any_failed(error, f"exporting {path}")

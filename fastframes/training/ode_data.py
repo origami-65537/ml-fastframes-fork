@@ -29,11 +29,12 @@ from pathlib import Path
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 
 from ..checkpoints import load_wan_base
 from ..wan.scheduler import FlowMatchScheduler
 from ..wan.text_encoder import TextEncoder
+from .checkpoint import save_safetensors_atomic
 from .data import read_prompts
 from .distributed import init_distributed, raise_if_any_failed
 
@@ -72,12 +73,6 @@ def sample_trajectory(teacher, cond, uncond, seed, *, steps, shift, guidance_sca
     if steps in stored_steps:
         states.append(latents[0].clone())
     return torch.stack(states)
-
-
-def _save_atomic(tensors, path):
-    tmp = path.with_name(f".{path.name}.tmp")
-    save_file(tensors, str(tmp))
-    os.replace(tmp, path)
 
 
 def _write_json_atomic(value, path):
@@ -119,11 +114,11 @@ def train(config):
                         teacher, cond, uncond, gen.seed + i, steps=gen.steps, shift=gen.shift,
                         guidance_scale=gen.guidance_scale, stored_steps=stored_steps,
                         latent_shape=tuple(gen.latent_shape), device=ctx.device)
-                    _save_atomic({"trajectory": trajectory.cpu()}, partial)
+                    save_safetensors_atomic(partial, {"trajectory": trajectory})
                     if ctx.is_main:
                         print(f"[ode_data] sample {i} done", flush=True)
                 trajectories.append(load_file(str(partial))["trajectory"])
-            _save_atomic({"trajectories": torch.stack(trajectories)}, out / f"{name}.safetensors")
+            save_safetensors_atomic(out / f"{name}.safetensors", {"trajectories": torch.stack(trajectories)})
             _write_json_atomic([{"sample_id": i, "seed": gen.seed + i, "prompt": prompts[i]} for i in ids], rows)
             for i in ids:
                 (out / "partial" / f"{i:08d}.safetensors").unlink()

@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import os
 import random
 import time
 from dataclasses import dataclass
@@ -333,14 +332,6 @@ class MasterAdamW:
 
 
 # ---------------------------------------------------------------------------------------------- training
-def _save_safetensors(path, state):
-    from safetensors.torch import save_file
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    save_file({k: v.detach().cpu().contiguous() for k, v in state.items()}, str(tmp))
-    os.replace(tmp, path)
-
-
 class Trainer:
 
     def __init__(self, config):
@@ -499,7 +490,7 @@ class Trainer:
         error = None
         if self.ctx.is_main:
             try:
-                _save_safetensors(path, self.refiner.state_dict())
+                checkpoint.save_safetensors_atomic(path, self.refiner.state_dict())
                 print(f"[kv_refinement] exported {path}", flush=True)
             except Exception as exc:  # noqa: BLE001 - reported collectively
                 error = exc
