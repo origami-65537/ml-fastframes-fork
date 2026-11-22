@@ -40,15 +40,15 @@ class FastFramesConfig:
     """Numerical recipe of a released model.
 
     ``noise="sequential"`` draws each transition noise from the seeded generator when
-    it is needed; ``"pregenerated"`` draws all ``3 x latent`` transition noises right
-    after the initial noise; ``"reseeded"`` draws them when needed from a second
+    it is needed; ``"pregenerated"`` draws all ``num_transitions x latent`` transition
+    noises right after the initial noise; ``"reseeded"`` draws them when needed from a second
     generator with the same seed (the convention of the qualitative figures).
     ``autocast`` runs text encoding, the DiT and the KV refinement network under
     BF16 autocast. ``fast_ops`` enables fused QKV, FP32
     real-valued RoPE and GEMM patch embedding. ``contiguous_stem`` selects the memory
     layout of the refinement stem tokens (it changes GEMM kernel selection, hence bits);
     ``allow_tf32`` is the process-wide TF32 matmul setting the model was evaluated with
-    (see ``configure_backends``).
+    (see ``configure_backends``). ``shift`` is the flow-matching scheduler shift.
     """
 
     name: str
@@ -65,6 +65,12 @@ class FastFramesConfig:
     num_frames: int = 21
     latent_size: tuple = (60, 104)
     num_pixel_frames: int = 81
+    shift: float = 5.0
+
+    @property
+    def num_transitions(self):
+        """Transition noises per frame of a pre-generated noise bank."""
+        return max(len(self.timesteps), len(self.first_frame_timesteps)) - 1
 
 
 # 1.3B: CF++ frame-wise 2-step generator; shifted timesteps of nominal [1000, 750, 500, 250].
@@ -118,7 +124,7 @@ class FastFrames:
         self.config = config
         self.dit, self.refiner, self.decoder, self.text_encoder = dit, refiner, decoder, text_encoder
         self.device = dit.patch_embedding.weight.device
-        self.scheduler = FlowMatchScheduler(shift=5.0)
+        self.scheduler = FlowMatchScheduler(shift=config.shift)
         height, width = config.latent_size
         self.frame_tokens = height * width // 4
         self.fast = FastOps(dit, height, width, config.num_frames) if config.fast_ops else None
@@ -172,7 +178,8 @@ class FastFrames:
         generator = torch.Generator(device=self.device).manual_seed(int(seed))
         noise = torch.randn(shape, generator=generator, device=self.device, dtype=torch.bfloat16)
         if cfg.noise == "pregenerated":
-            transition = torch.randn((3, *shape), generator=generator, device=self.device, dtype=torch.bfloat16)
+            transition = torch.randn((cfg.num_transitions, *shape), generator=generator, device=self.device,
+                                     dtype=torch.bfloat16)
             return noise, lambda step, frame: transition[step, :, frame]
         if cfg.noise == "reseeded":
             generator = torch.Generator(device=self.device).manual_seed(int(seed))
