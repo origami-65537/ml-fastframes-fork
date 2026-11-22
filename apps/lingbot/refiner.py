@@ -92,6 +92,10 @@ class _Heads(torch.nn.Module):
         return kr, vr
 
 
+def _write_refined_key(key, rope, destination):
+    destination.copy_(rope_real(key, rope).reshape_as(destination))
+
+
 class KVRefiner:
     """Refine the chunk's cache slot in place: ``refiner(x0, y, rope, read_frames)``.
 
@@ -100,16 +104,19 @@ class KVRefiner:
     """
 
     def __init__(self, net, patch, cache_k, cache_v, key, value, timestep, *, world=1, rank=0,
-                 heads_per_stream=None, compile=True, graphs=True):
+                 heads_per_stream=None, direct_kv=False, compile=True, graphs=True):
         import torch._inductor.config as inductor_config
         inductor_config.emulate_precision_casts = True
         if world not in (1, 8):
             raise ValueError("KV refinement supports 1 or 8 GPUs")
+        if direct_kv and world != 1:
+            raise ValueError("direct KV refinement requires one GPU")
         layers, dim = net.num_blocks, net.dim
-        heads_per_stream = heads_per_stream or layers
-        if layers % heads_per_stream:
-            raise ValueError("heads_per_stream must divide the number of layers")
+        heads_per_stream = layers if heads_per_stream is None else heads_per_stream
+        if heads_per_stream < 1 or layers % heads_per_stream:
+            raise ValueError("heads_per_stream must be a positive divisor of the number of layers")
         self.world, self.rank, self.layers, self.dim = world, rank, layers, dim
+        self.direct_kv = direct_kv
         self.cache_k, self.cache_v = cache_k, cache_v
         self.k, self.v = key.view(layers, TOKENS, dim), value.view(layers, TOKENS, dim)
         self.use_graphs, self.graphs = graphs, {}
@@ -130,10 +137,12 @@ class KVRefiner:
         self.stem = compiled(self.stem_module)
         self.heads = [compiled(h) for h in self.head_modules]
         self.rotate = compiled(rope_real)
+        self.write_key = compiled(_write_refined_key)
         self.commit = compiled(self._commit)
         self.streams = [torch.cuda.Stream(device=device) for _ in self.heads] if len(self.heads) > 1 else []
         self.local_tokens = TOKENS // world
-        self.local = torch.empty(2, layers, self.local_tokens, dim, device=device, dtype=torch.bfloat16)
+        self.local = (None if direct_kv else
+                      torch.empty(2, layers, self.local_tokens, dim, device=device, dtype=torch.bfloat16))
         self.gathered = (torch.empty(world, 2, layers, self.local_tokens, dim, device=device, dtype=torch.bfloat16)
                          if world > 1 else None)
         self.pool = torch.cuda.graph_pool_handle()
@@ -144,10 +153,18 @@ class KVRefiner:
         self.cache_k[:, :, end - TOKENS:end].copy_(key.reshape(shape))
         self.cache_v[:, :, end - TOKENS:end].copy_(value.reshape(shape))
 
-    def _refine(self, head, first, last, phi, lo, hi):
+    def _refine(self, head, first, last, phi, lo, hi, read_frames):
         kr, vr = head(self.k[first:last, lo:hi], self.v[first:last, lo:hi], phi)
         heads = self.cache_k.shape[-2]
-        physical = self.rotate(kr.reshape(last - first, self.local_tokens, heads, -1), self.rope[lo:hi])
+        kr = kr.reshape(last - first, self.local_tokens, heads, -1)
+        if self.direct_kv:
+            end = read_frames * FRAME_TOKENS
+            dst_k = self.cache_k[first:last, :, end - TOKENS:end]
+            dst_v = self.cache_v[first:last, :, end - TOKENS:end]
+            self.write_key(kr, self.rope[lo:hi], dst_k)
+            dst_v.copy_(vr.reshape_as(dst_v))
+            return
+        physical = self.rotate(kr, self.rope[lo:hi])
         self.local[0, first:last].copy_(physical.reshape(last - first, self.local_tokens, self.dim))
         self.local[1, first:last].copy_(vr)
 
@@ -161,11 +178,13 @@ class KVRefiner:
                 for group, (head, stream) in enumerate(zip(self.heads, self.streams)):
                     stream.wait_stream(caller)
                     with torch.cuda.stream(stream):
-                        self._refine(head, group * self.count, (group + 1) * self.count, phi, lo, hi)
+                        self._refine(head, group * self.count, (group + 1) * self.count, phi, lo, hi, read_frames)
                 for stream in self.streams:
                     caller.wait_stream(stream)
             else:
-                self._refine(self.heads[0], 0, self.layers, phi, lo, hi)
+                self._refine(self.heads[0], 0, self.layers, phi, lo, hi, read_frames)
+            if self.direct_kv:
+                return
             if self.world > 1:
                 dist.all_gather_into_tensor(self.gathered.view(-1, self.local_tokens, self.dim),
                                             self.local.view(-1, self.local_tokens, self.dim))
@@ -197,6 +216,11 @@ class KVRefiner:
             self.graphs[read_frames] = graph
         self.graphs[read_frames].replay()
 
+    def clear_graphs(self):
+        if self.graphs:
+            torch.cuda.synchronize(self.k.device)
+        self.graphs.clear()
+
     def close(self):
         torch.cuda.synchronize(self.k.device)
-        self.graphs.clear()
+        self.clear_graphs()

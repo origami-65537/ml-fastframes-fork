@@ -18,9 +18,12 @@ class TextEncoder(nn.Module):
     def __init__(self, wan_dir, text_len=512):
         super().__init__()
         wan_dir = Path(wan_dir)
-        self.text_encoder = umt5_xxl_encoder().eval().requires_grad_(False)
+        self.text_encoder = umt5_xxl_encoder(device="meta")
         self.text_encoder.load_state_dict(
-            torch.load(wan_dir / "models_t5_umt5-xxl-enc-bf16.pth", map_location="cpu", weights_only=True))
+            torch.load(wan_dir / "models_t5_umt5-xxl-enc-bf16.pth", map_location="cpu",
+                       mmap=True, weights_only=True),
+            strict=True, assign=True)
+        self.text_encoder = self.text_encoder.eval().requires_grad_(False)
         self.tokenizer = HuggingfaceTokenizer(
             name=str(wan_dir / "google" / "umt5-xxl"), seq_len=text_len, clean="whitespace",
             local_files_only=True)

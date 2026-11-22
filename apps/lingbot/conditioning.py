@@ -42,9 +42,7 @@ DEFAULT_INTRINSICS = (502.9116, 503.10812, 415.77786, 239.77779)
 
 def text_context(text_encoder, prompt, device):
     """umT5 embedding of ``prompt`` padded to 512 tokens, ``[512, 4096]`` BF16."""
-    text_encoder.model.to(device)
-    raw = text_encoder([prompt], device)[0]
-    text_encoder.model.cpu()
+    raw = text_encoder([prompt], torch.device("cpu"))[0].to(device)
     return torch.cat([raw, raw.new_zeros(512 - raw.shape[0], raw.shape[1])])
 
 
@@ -61,7 +59,11 @@ def image_condition(vae, image, latents, device):
     pixels = TF.to_tensor(image.convert("RGB")).sub_(0.5).div_(0.5)
     first = F.interpolate(pixels[None], size=(HEIGHT, WIDTH), mode="bicubic").transpose(0, 1)
     video = torch.cat([first, torch.zeros(3, 4 * (latents - 1), HEIGHT, WIDTH)], dim=1).to(device)
-    encoded = vae.encode([video])[0]
+    vae.model.to(device)
+    try:
+        encoded = vae.encode([video])[0]
+    finally:
+        vae.model.cpu()
     mask = torch.zeros(4, latents, LATENT_HEIGHT, LATENT_WIDTH, device=device, dtype=encoded.dtype)
     mask[:, 0] = 1
     return torch.cat([mask, encoded])

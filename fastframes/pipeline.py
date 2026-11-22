@@ -158,8 +158,13 @@ class FastFrames:
     # ------------------------------------------------------------------ text / noise
     @torch.inference_mode()
     def encode_prompt(self, prompt: str):
+        if self.text_encoder.device.type != "cuda":
+            self.text_encoder.to(self.device)
         with self.autocast():
-            return self.text_encoder([prompt])["prompt_embeds"]
+            embeds = self.text_encoder([prompt])["prompt_embeds"]
+        self.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
+        return embeds
 
     def _noise(self, seed):
         cfg = self.config
