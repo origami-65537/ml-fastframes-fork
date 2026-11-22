@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 from fastframes.pipeline import CONTEXT_MODES, MODELS, FastFrames, configure_backends, to_uint8  # noqa: E402
 from fastframes.video import save_video  # noqa: E402
 from fastframes.wan.vae import VideoVAE  # noqa: E402
+from scripts.generate import add_text_encoder_arguments  # noqa: E402
 
 FPS = 16
 SEED_STRIDE = 1000003
@@ -70,6 +71,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", choices=sorted(MODELS), required=True)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
+    add_text_encoder_arguments(parser)
     parser.add_argument("--context", choices=CONTEXT_MODES, default="refiner",
                         help="how finished frames enter the KV cache (see FastFrames.rollout)")
     parser.add_argument("--decoder", choices=("pixel", "vae"), default="pixel")
@@ -92,7 +94,7 @@ def main():
     config = dataclasses.replace(spec.config, noise=args.noise or PAGE_NOISE[args.model])
     configure_backends(config)
     model = FastFrames.from_pretrained(config, root / spec.wan_dir, root / spec.dit, root / spec.refiner,
-                                       root / spec.decoder)
+                                       root / spec.decoder, offload_text_encoder=args.offload_text_encoder)
     decode = make_decoder(args, model, root / spec.wan_dir)
     out = args.output_dir
     (out / "stills" if stills else out).mkdir(parents=True, exist_ok=True)

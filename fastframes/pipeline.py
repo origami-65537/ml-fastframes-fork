@@ -112,14 +112,23 @@ def to_uint8(pixels):
     return ((pixels.float().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8).permute(0, 2, 3, 1).contiguous()
 
 
+def _resolve_text_encoder_offload(device, requested):
+    if device.type == "cpu":
+        return False
+    if requested is not None:
+        return requested
+    return device.type == "cuda" and torch.cuda.get_device_properties(device).total_memory < 24 * 1024**3
+
+
 class FastFrames:
 
     def __init__(self, config: FastFramesConfig, dit, refiner, decoder, text_encoder=None, *,
-                 offload_text_encoder=False):
+                 offload_text_encoder: bool | None = None):
         self.config = config
         self.dit, self.refiner, self.decoder, self.text_encoder = dit, refiner, decoder, text_encoder
-        self.offload_text_encoder = offload_text_encoder
         self.device = dit.patch_embedding.weight.device
+        self.offload_text_encoder = text_encoder is not None and _resolve_text_encoder_offload(
+            self.device, offload_text_encoder)
         self.scheduler = FlowMatchScheduler(shift=5.0)
         height, width = config.latent_size
         self.frame_tokens = height * width // 4
@@ -128,8 +137,9 @@ class FastFrames:
         self._refine_embedding = None
 
     @classmethod
-    def from_pretrained(cls, config, wan_dir, dit, refiner, decoder, *, device="cuda", offload_text_encoder=False):
-        """Build from checkpoints; optionally keep T5 on CPU between encodes."""
+    def from_pretrained(cls, config, wan_dir, dit, refiner, decoder, *, device="cuda",
+                        offload_text_encoder: bool | None = None):
+        """Build from checkpoints; by default park T5 on CPU for CUDA devices with less than 24 GiB."""
         def state(value, key=None):
             return value if isinstance(value, dict) else load_state_dict(value, key)
 
@@ -147,11 +157,13 @@ class FastFrames:
             decoder_net = PixelDecoder(wan.dim)
             decoder_state = {k.removeprefix("pixel_head."): v for k, v in decoder_state.items()}
         decoder_net.load_state_dict(decoder_state, strict=True)
-        text_device = "cpu" if offload_text_encoder else device
+        inference_device = dit.patch_embedding.weight.device
+        offload = _resolve_text_encoder_offload(inference_device, offload_text_encoder)
+        text_device = "cpu" if offload else inference_device
         text_encoder = TextEncoder(Path(wan_dir)).to(text_device, dtype=torch.bfloat16)
         return cls(config, dit, refiner_net.to(device).eval().requires_grad_(False),
                    decoder_net.to(device, dtype=config.decoder_dtype).eval().requires_grad_(False),
-                   text_encoder, offload_text_encoder=offload_text_encoder)
+                   text_encoder, offload_text_encoder=offload)
 
     def autocast(self):
         if self.config.autocast:
@@ -161,7 +173,7 @@ class FastFrames:
     # ------------------------------------------------------------------ text / noise
     @torch.inference_mode()
     def encode_prompt(self, prompt: str):
-        offload = self.offload_text_encoder and self.device.type != "cpu"
+        offload = self.offload_text_encoder
         try:
             if offload or self.text_encoder.device != self.device:
                 self.text_encoder.to(self.device)
