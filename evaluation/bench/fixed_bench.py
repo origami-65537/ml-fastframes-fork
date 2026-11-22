@@ -18,6 +18,7 @@ from evaluation.bench.compare import append_history, read_history, table  # noqa
 from evaluation.bench.profiling import profile_report  # noqa: E402
 from evaluation.bench.quality import compare, sanity, verdict  # noqa: E402
 from evaluation.bench.stats import sample_stats  # noqa: E402
+from scripts.generate import add_text_encoder_arguments  # noqa: E402
 
 
 def parser():
@@ -29,6 +30,7 @@ def parser():
     p.add_argument("--repeats", type=int, default=3, help="timed runs per identical condition")
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
+    add_text_encoder_arguments(p)
     p.add_argument("--lingbot-root")
     p.add_argument("--lingbot-checkpoint", type=Path)
     p.add_argument("--assets-dir", type=Path)
@@ -67,7 +69,8 @@ def adapter(args):
     if args.model == "ff-s":
         from scripts.generate import load_model
         args.prompt = args.prompt if args.prompt is not None else "A corgi surfing a wave at sunset"
-        model = load_model("ff-s", args.checkpoint_dir)
+        model = load_model("ff-s", args.checkpoint_dir, offload_text_encoder=args.offload_text_encoder)
+        args.effective_offload_text_encoder = model.offload_text_encoder
         return (lambda: model.generate(args.prompt, args.seed), lambda: None, (81, 480, 832, 3), None, nullcontext,
                 None)
     from apps.lingbot.generate import CHUNK, add_model_arguments, import_upstream, load_pipeline, read_condition
@@ -162,6 +165,8 @@ def main(argv=None):
         p.error("--warmup must be nonnegative and --profile-repeats must be positive")
     if args.stage_timing and args.model != "lingbot-1.3b":
         p.error("--stage-timing is only supported for lingbot-1.3b")
+    if args.offload_text_encoder is not None and args.model != "ff-s":
+        p.error("--offload-text-encoder and --keep-text-encoder are only supported for ff-s")
     import torch
 
     if not torch.cuda.is_available():

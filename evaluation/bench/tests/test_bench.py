@@ -2,6 +2,8 @@ import json
 import math
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -13,6 +15,7 @@ from evaluation.bench.profiling import classify, correlation_stages, profile_rep
 from evaluation.bench.quality import compare, sanity, verdict
 from evaluation.bench.stages import TimingProxy, annotate_stages, measure_stages, summarize_events
 from evaluation.bench.stats import sample_stats
+from scripts import generate
 
 
 @pytest.fixture(autouse=True)
@@ -65,8 +68,15 @@ def test_every_repeat(monkeypatch, tmp_path, capsys, case):
     first = {"normal": good, "constant": torch.zeros_like(good), "empty": good[:0],
              "reference": 255-good, "shape": good[:1]}[case]
     videos = iter([first, good])
-    monkeypatch.setattr(fixed_bench, "adapter", lambda args:
-                        (lambda: next(videos), lambda: None, good.shape, None, nullcontext, None))
+    load_model = Mock(return_value=SimpleNamespace(generate=lambda *_: next(videos), offload_text_encoder=True))
+    monkeypatch.setattr(generate, "load_model", load_model)
+    adapter = fixed_bench.adapter
+
+    def small_adapter(args):
+        generate_video, close, _, *rest = adapter(args)
+        return (generate_video, close, good.shape, *rest)
+
+    monkeypatch.setattr(fixed_bench, "adapter", small_adapter)
     for name in ("set_device", "synchronize", "reset_peak_memory_stats"):
         monkeypatch.setattr(torch.cuda, name, lambda *args: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -89,6 +99,9 @@ def test_every_repeat(monkeypatch, tmp_path, capsys, case):
     result = fixed_bench.main(["--warmup", "0", "--repeats", "2", "--reference-dir", str(reference_dir),
                                "--history", str(history), "--run-dir", str(tmp_path / "runs")])
     record = read_history(history)[0]
+    load_model.assert_called_once_with("ff-s", parser().get_default("checkpoint_dir"), offload_text_encoder=None)
+    assert record["args"]["offload_text_encoder"] is None
+    assert record["args"]["effective_offload_text_encoder"] is True
     assert result == int(case != "normal")
     assert len(record["repeat_quality"]) == 2
     assert record["repeat_quality"][0]["max_abs_diff_vs_previous"] is None
@@ -189,6 +202,21 @@ def test_stats_and_defaults():
            "memory": {"allocated_gb": 1, "reserved_gb": 2}, "verdict": "pass"}
     report = table([row])
     assert "ms_per_frame" in report and "50.00%" in report and "stdev" in report
+
+
+@pytest.mark.parametrize(("flag", "offload"), [("--offload-text-encoder", True), ("--keep-text-encoder", False)])
+def test_bench_passes_explicit_text_encoder_placement(flag, offload, monkeypatch):
+    args = parser().parse_args([flag])
+    load_model = Mock(return_value=SimpleNamespace(offload_text_encoder=offload))
+    monkeypatch.setattr(generate, "load_model", load_model)
+    fixed_bench.adapter(args)
+    load_model.assert_called_once_with("ff-s", args.checkpoint_dir, offload_text_encoder=offload)
+    assert args.effective_offload_text_encoder is offload
+
+
+def test_text_encoder_placement_flags_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        parser().parse_args(["--offload-text-encoder", "--keep-text-encoder"])
 
 
 def test_stage_proxy():
