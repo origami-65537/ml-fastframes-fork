@@ -241,7 +241,8 @@ recorded as LOW-CONFIDENCE (`fps_gate.status`), and is never used as a later
 baseline; rerun the condition before trusting the fps. LingBot history keys also
 include `timing_scope` ("steps only (start untimed)"): condition encoding in
 `start()` is outside the timed and peak-VRAM windows. Reference files use the key
-without `timing_scope` (`reference_key`), so references saved before it still load.
+without `timing_scope` (`reference_key`), so references saved before it still load;
+a reference saved under the timing-scoped key is used when no `reference_key` file exists.
 
 Every timed repeat is checked after its timer stops, then discarded before the
 next generation (only the last video is retained for optional reference saving;

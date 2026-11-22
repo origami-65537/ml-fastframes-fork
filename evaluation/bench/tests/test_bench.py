@@ -1,6 +1,7 @@
 import json
 import math
 from contextlib import nullcontext
+from pathlib import Path
 
 import pytest
 import torch
@@ -432,6 +433,21 @@ def test_reference_survives_timing_scope(monkeypatch, tmp_path):
     assert fixed_bench.main(argv + ["--history", str(history)]) == 1
     record = read_history(history)[0]
     assert record["verdict"] == "fail" and record["quality"]
+
+
+def test_timing_scoped_reference_still_loads(monkeypatch, tmp_path):
+    fake_bench(monkeypatch, generate=lambda: torch.full((2, 12, 12, 3), 129, dtype=torch.uint8),
+               timing_scope="steps only (start untimed)")
+    history = tmp_path / "history.jsonl"
+    argv = ["--warmup", "0", "--repeats", "1", "--history", str(history),
+            "--reference-dir", str(tmp_path / "ref"), "--run-dir", str(tmp_path / "runs")]
+    fixed_bench.main(argv)
+    scoped = Path(read_history(history)[0]["reference"]).with_name(read_history(history)[0]["key"] + ".pt")
+    scoped.parent.mkdir(parents=True)
+    torch.save(torch.randint(40, 210, (2, 12, 12, 3), dtype=torch.uint8), scoped)
+    assert fixed_bench.main(argv) == 1
+    record = read_history(history)[-1]
+    assert record["reference"] == str(scoped) and record["quality"] and record["verdict"] == "fail"
 
 
 def test_noisy_run_never_becomes_baseline(monkeypatch, tmp_path):

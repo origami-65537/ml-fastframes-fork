@@ -191,8 +191,12 @@ def main(argv=None):
                 torch.cuda.synchronize()
                 del warmup
             refpath = args.reference_dir / f"{reference_key}.pt"
-            has_reference = refpath.exists()
-            reference = torch.load(refpath, map_location="cpu", weights_only=True) if has_reference else None
+            scoped_refpath = args.reference_dir / f"{key}.pt"
+            # New references are saved under reference_key; ones saved under the timing-scoped key still load.
+            loaded_refpath = refpath if refpath.exists() or not scoped_refpath.exists() else scoped_refpath
+            has_reference = loaded_refpath.exists()
+            reference = (torch.load(loaded_refpath, map_location="cpu", weights_only=True)
+                         if has_reference else None)
             if not has_reference and not args.save_reference:
                 print(f"WARNING: no reference at {refpath}; use --save-reference at the baseline commit")
             torch.cuda.reset_peak_memory_stats()
@@ -235,6 +239,7 @@ def main(argv=None):
                     refpath.parent.mkdir(parents=True, exist_ok=True)
                     save_video(refpath.with_suffix(".mp4"), video)
                     torch.save(video, refpath)
+                    loaded_refpath = refpath
                     has_reference = True
                     reference_saved = True
             del video, reference
@@ -262,7 +267,8 @@ def main(argv=None):
                       "repeat_quality": repeat_quality,
                       "repeat_max_abs_diff": max(diffs) if diffs else None,
                       "verdict": status, "reasons": reasons,
-                      "reference": str(refpath), "reference_key": reference_key, "reference_saved": reference_saved}
+                      "reference": str(loaded_refpath), "reference_key": reference_key,
+                      "reference_saved": reference_saved}
             if args.profile:
                 traces, walls = [], []
                 for index in range(args.profile_repeats):
