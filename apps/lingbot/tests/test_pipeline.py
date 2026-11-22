@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -91,6 +92,34 @@ def test_sliced_camera_matches_full_bank_and_tracks_storage(monkeypatch):
     assert [dst.numel() for dst in destinations] == [expected[0].numel()] * len(m.blocks)
     torch.testing.assert_close(old_storage, expected, rtol=0, atol=0)
     torch.testing.assert_close(runner.camera_params, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("world", "compile", "overrides", "expected"),
+    [
+        (1, True, {}, (True, True)),
+        (1, False, {}, (False, True)),
+        (1, True, {"LB_COMPILE_REFINER": "0", "LB_REFINER_DIRECT_KV": "0"}, (False, False)),
+        (8, True, {}, (True, False)),
+    ],
+)
+def test_refiner_defaults_respect_eager_world_and_overrides(world, compile, overrides, expected, monkeypatch):
+    for flag in ("LB_COMPILE_REFINER", "LB_REFINER_DIRECT_KV"):
+        monkeypatch.delenv(flag, raising=False)
+    for flag, value in overrides.items():
+        monkeypatch.setenv(flag, value)
+    monkeypatch.setenv("LB_STEPS", "2")
+    grid = torch.arange(1000)
+    scheduler = SimpleNamespace(timesteps=grid, sigmas=grid, set_timesteps=Mock())
+    dit = SimpleNamespace(patch_embedding=torch.nn.Linear(1, 1), blocks=[None], dim=1, num_heads=1)
+    upstream = SimpleNamespace(dit=dit, scheduler=scheduler, config=SimpleNamespace(num_train_timesteps=1000))
+    with (patch.object(pipeline, "LingBotDiT"), patch.object(pipeline, "KVRefiner") as refiner,
+          patch.object(pipeline, "CapturedDecoder"), patch.object(pipeline, "SpatialDecoder"),
+          patch.object(pipeline, "rope_frequencies")):
+        pipeline.FastFramesLingBot(pipeline.MODELS["lingbot-1.3b"], upstream, None, None,
+                                   world=world, compile=compile, graphs=False)
+    args = refiner.call_args.kwargs
+    assert (args["compile"], args["direct_kv"]) == expected
 
 
 def test_direct_refiner_commit_matches_staged_commit(monkeypatch):
