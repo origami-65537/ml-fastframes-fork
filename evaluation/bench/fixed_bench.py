@@ -10,8 +10,10 @@ import subprocess
 import sys
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from evaluation.bench.compare import append_history, read_history, table  # noqa: E402
@@ -55,6 +57,19 @@ def parser():
 
 
 LINGBOT_TIMING_SCOPE = "steps only (start untimed)"
+FF_S_SHAPE = (81, 480, 832, 3)
+LINGBOT_HW = (464, 832)
+
+
+@dataclass
+class Workload:
+    """What main() needs from a model: timed generate(), cleanup, and optional diagnostics."""
+    generate: Callable
+    close: Callable
+    expected_shape: tuple
+    stage_timing: Optional[Callable] = None
+    stage_scope: Callable = nullcontext
+    timing_scope: Optional[str] = None
 
 
 def workload_key(config):
@@ -68,8 +83,7 @@ def adapter(args):
         from scripts.generate import load_model
         args.prompt = args.prompt if args.prompt is not None else "A corgi surfing a wave at sunset"
         model = load_model("ff-s", args.checkpoint_dir)
-        return (lambda: model.generate(args.prompt, args.seed), lambda: None, (81, 480, 832, 3), None, nullcontext,
-                None)
+        return Workload(lambda: model.generate(args.prompt, args.seed), lambda: None, FF_S_SHAPE)
     from apps.lingbot.generate import CHUNK, add_model_arguments, import_upstream, load_pipeline, read_condition
 
     model_parser = argparse.ArgumentParser()
@@ -107,8 +121,8 @@ def adapter(args):
         return measure_stages(pipe, generate, lambda: chunk_index[0])
 
     from evaluation.bench.stages import annotate_stages
-    return (generate, pipe.close, (CHUNK * chunks * 4 - 3, 464, 832, 3), stage_timing,
-            lambda: annotate_stages(pipe), LINGBOT_TIMING_SCOPE)
+    return Workload(generate, pipe.close, (CHUNK * chunks * 4 - 3, *LINGBOT_HW, 3), stage_timing=stage_timing,
+                    stage_scope=lambda: annotate_stages(pipe), timing_scope=LINGBOT_TIMING_SCOPE)
 
 
 def max_abs_diff(video, previous):
@@ -167,7 +181,8 @@ def main(argv=None):
     if not torch.cuda.is_available():
         p.error("a CUDA GPU is required for generation (metrics/tests work on CPU)")
     torch.cuda.set_device(0)
-    generate, close, expected, stage_timing, stage_scope, timing_scope = adapter(args)
+    workload = adapter(args)
+    generate, expected, timing_scope = workload.generate, workload.expected_shape, workload.timing_scope
     config = {k: getattr(args, k) for k in ("model", "prompt", "seed", "frames")}
     config["example"] = str(args.example.resolve()) if args.example else None
     # References depend only on what is generated; history keys also separate timing semantics.
@@ -275,7 +290,7 @@ def main(argv=None):
                     torch.cuda.synchronize()
                     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                            torch.profiler.ProfilerActivity.CUDA]) as prof, \
-                            stage_scope():
+                            workload.stage_scope():
                         start = time.perf_counter()
                         profiled = generate()
                         torch.cuda.synchronize()
@@ -288,7 +303,7 @@ def main(argv=None):
                 record["profile"] = str(run / "profile.md")
                 record["profile_samples"] = {"traces": traces, "wall_seconds": walls}
             if args.stage_timing:
-                record["stage_timing"] = stage_timing()
+                record["stage_timing"] = workload.stage_timing()
             record = json_safe(record)
             Path(str(run) + ".json").write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
             append_history(args.history, record)
@@ -308,7 +323,7 @@ def main(argv=None):
                 print(f"FAIL: {reason}")
             return int(status == "fail")
     finally:
-        close()
+        workload.close()
 
 
 if __name__ == "__main__":
