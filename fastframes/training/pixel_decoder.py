@@ -46,7 +46,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from ..checkpoints import build_wan, load_state_dict
 from ..models.pixel_decoder import BridgedPixelDecoder, PixelDecoder, align_frames
 from ..pipeline import FastFrames, FastFramesConfig
-from ..wan.causal_model import allocate_kv_cache
 from ..wan.model import WAN_CONFIGS
 from ..wan.text_encoder import TextEncoder
 from ..wan.vae import VideoVAE
@@ -118,29 +117,9 @@ class PrimedRollout:
     def __init__(self, dit, recipe: FastFramesConfig):
         self.ff = FastFrames(recipe, dit, refiner=None, decoder=None)
 
-    @torch.no_grad()
     def __call__(self, prompt_embeds, seed):
         """Latents ``[1, F, 16, h, w]``, features ``[1, F*L, C]`` and modulation ``[1, F, 1, C]``."""
-        ff, cfg = self.ff, self.ff.config
-        noise, transition = ff._noise(seed)
-        text_cache = ff.dit.text_cache(prompt_embeds)
-        kv_cache = allocate_kv_cache(ff.dit, cfg.num_frames, ff.frame_tokens, device=ff.device)
-        latents, features, modulation = torch.empty_like(noise), [], []
-        for frame in range(cfg.num_frames):
-            schedule = cfg.first_frame_timesteps if frame == 0 else cfg.timesteps
-            x = noise[:, frame:frame + 1]
-            for step, timestep in enumerate(schedule):
-                x0, feature, mod = ff._predict(x, timestep, frame, text_cache, kv_cache)
-                if step + 1 < len(schedule):
-                    next_t = torch.full((1,), schedule[step + 1], device=ff.device, dtype=torch.float32)
-                    x = ff.scheduler.add_noise(x0.flatten(0, 1), transition(step, frame), next_t).unflatten(
-                        0, x0.shape[:2])
-            latents[:, frame:frame + 1].copy_(x0)
-            features.append(feature)
-            modulation.append(mod)
-            if frame + 1 < cfg.num_frames:  # the last frame's clean pass would be read by no one
-                ff._predict(x0, 0.0, frame, text_cache, kv_cache)
-        return latents, torch.cat(features, dim=1), torch.cat(modulation, dim=1)
+        return self.ff.rollout_frames(prompt_embeds, seed, context="dit", grad_mode=torch.no_grad, prime_last=False)
 
 
 # ---------------------------------------------------------------------------------------------- decoder
