@@ -28,9 +28,8 @@ layer norms and the output head in FP32, the time MLP in FP32.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import os
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -99,12 +98,12 @@ def layer_norm(value, module):
     return F.layer_norm(value.float(), (value.shape[-1],), weight, bias, module.eps).to(value.dtype)
 
 
-def attention(query, key, value, split=1, sage=False):
+def attention(query, key, value, split=1, sage=False, precenter=False):
     """``query [1, Q, H, D]`` over ``key, value [1, K, H, D]`` with cuDNN; exact split-KV merge."""
     if sage and split == 1:
         from .sage_attention import sage_attention
 
-        return sage_attention(query, key, value)
+        return sage_attention(query, key, value, precenter)
     q = query.transpose(1, 2)
     if split == 1:
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
@@ -148,12 +147,13 @@ class LingBotDiT:
         self.head_dim, self.layers = self.dim // self.heads, len(model.blocks)
         self.device = model.patch_embedding.weight.device
         self.split_kv, self.use_graphs = int(split_kv), bool(graphs)
-        self.sage_self = os.environ.get("LB_ATTN") == "sage" and self.world == 1 and self.split_kv == 1
-        self.sage_cross = os.environ.get("LB_ATTN_CROSS") == "sage" and self.world == 1
-        if self.sage_self or self.sage_cross:
-            from .sage_attention import load_sage
+        from .sage_attention import use_sage
 
-            load_sage()
+        self.sage_self = use_sage(os.environ.get("LB_ATTN", "auto"), self.device, self.head_dim,
+                                  eligible=self.world == 1 and self.split_kv == 1)
+        self.sage_cross = use_sage(os.environ.get("LB_ATTN_CROSS", "cudnn"), self.device, self.head_dim,
+                                   eligible=self.world == 1)
+        self.sage_precenter = os.environ.get("LB_SAGE_PRECENTER") == "1"
         self.timesteps = tuple(int(t) for t in timesteps) + (0,)
         self.final_timestep = self.timesteps[-2]
         if TOKENS % self.world or (CACHE_FRAMES * FRAME_TOKENS) % self.split_kv:
@@ -183,16 +183,16 @@ class LingBotDiT:
             torch.empty((1, CHUNK, 1, dim), device=device),
             torch.empty(shape, device=device, dtype=torch.bfloat16),
             torch.empty(shape, device=device, dtype=torch.bfloat16))
-        self.patch_weight = model.patch_embedding.weight.reshape(dim, -1).contiguous()
-        self.use_fp8 = os.environ.get("LB_FP8") == "1"
-        if self.use_fp8:
+        fp8 = os.environ.get("LB_FP8", "0")
+        fp8_qkv = None
+        if fp8 != "0":
             from .fp8 import quantize_dit
 
-            self.qkv = [(linear, None) for linear in quantize_dit(model)]
-        else:
-            self.qkv = [(torch.cat([b.self_attn.q.weight, b.self_attn.k.weight, b.self_attn.v.weight]).contiguous(),
-                         torch.cat([b.self_attn.q.bias, b.self_attn.k.bias, b.self_attn.v.bias]).contiguous())
-                        for b in model.blocks]
+            fp8_qkv = quantize_dit(model, scope=fp8)
+        self.qkv = ([(linear, None) for linear in fp8_qkv] if fp8_qkv is not None else
+                    [(torch.cat([b.self_attn.q.weight, b.self_attn.k.weight, b.self_attn.v.weight]),
+                      torch.cat([b.self_attn.q.bias, b.self_attn.k.bias, b.self_attn.v.bias]))
+                     for b in model.blocks])
         self.cam = [(torch.cat([b.cam_scale_layer.weight, b.cam_shift_layer.weight]).contiguous(),
                      torch.cat([b.cam_scale_layer.bias, b.cam_shift_layer.bias]).contiguous())
                     for b in model.blocks]
@@ -260,7 +260,8 @@ class LingBotDiT:
     def _patch(self):
         inputs = torch.cat([self.x, self.y], 0)[None]
         tokens = inputs.reshape(1, 36, CHUNK, GRID_H, 2, GRID_W, 2).permute(0, 2, 3, 5, 1, 4, 6).reshape(1, TOKENS, 144)
-        return F.linear(tokens[:, self.start:self.end], self.patch_weight, self.model.patch_embedding.bias)
+        patch = self.model.patch_embedding
+        return F.linear(tokens[:, self.start:self.end], patch.weight.reshape(self.dim, -1), patch.bias)
 
     def _prepare_camera(self):
         m = self.model
@@ -280,7 +281,7 @@ class LingBotDiT:
         e = (block.modulation.unsqueeze(0) + self.time_e0).unbind(2)
         hidden = layer_norm(value, block.norm1).float() * (1 + e[1]) + e[0]
         a = block.self_attn
-        qkv = qkv_weight(hidden) if self.use_fp8 else F.linear(hidden, qkv_weight, qkv_bias)
+        qkv = qkv_weight(hidden) if qkv_bias is None else F.linear(hidden, qkv_weight, qkv_bias)
         query, key, val = qkv.chunk(3, -1)
         query = rms_norm(query, a.norm_q).view(1, tokens, heads, head_dim)
         key = rms_norm(key, a.norm_k).view(1, tokens, heads, head_dim)
@@ -301,13 +302,15 @@ class LingBotDiT:
         cache_k[:, end - TOKENS:end].copy_(physical_key)
         cache_v[:, end - TOKENS:end].copy_(val)
         split = self.split_kv if end % self.split_kv == 0 else 1
-        attended = attention(query, cache_k[:, :end], cache_v[:, :end], split, sage=self.sage_self)
-        value = value + F.linear(attended.reshape(1, tokens, self.dim), a.o.weight, a.o.bias) * e[2]
+        attended = attention(query, cache_k[:, :end], cache_v[:, :end], split, sage=self.sage_self,
+                             precenter=self.sage_precenter)
+        value = value + a.o(attended.reshape(1, tokens, self.dim)) * e[2]
         # Upstream forms 1 + camera_scale in BF16 before the FP32 residual product.
         value = (1.0 + cam[0]) * value + cam[1]
         cross = block.cross_attn
         q = rms_norm(cross.q(layer_norm(value, block.norm3)), cross.norm_q).view(1, tokens, heads, head_dim)
-        value = value + cross.o(attention(q, text_k, text_v, sage=self.sage_cross).reshape(1, tokens, self.dim))
+        attended = attention(q, text_k, text_v, sage=self.sage_cross, precenter=self.sage_precenter)
+        value = value + cross.o(attended.reshape(1, tokens, self.dim))
         hidden = layer_norm(value, block.norm2).float() * (1 + e[4]) + e[3]
         return value + block.ffn(hidden) * e[5]
 
@@ -398,10 +401,16 @@ class LingBotDiT:
 
     __call__ = forward
 
+    def clear_graphs(self):
+        if self.graphs or self._camera_graph is not None:
+            torch.cuda.synchronize(self.device)
+        self.graphs.clear()
+        self._camera_graph = None
+        self._chunk_staged = False
+
     def close(self):
         """Release graphs before their symmetric-memory buffers (call on every rank)."""
         torch.cuda.synchronize(self.device)
-        self.graphs.clear()
-        self._camera_graph = None
+        self.clear_graphs()
         self.gather = [None] * self.layers
         self.feature_gather = self.output_gather = None

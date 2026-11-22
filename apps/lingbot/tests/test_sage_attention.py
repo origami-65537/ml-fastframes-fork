@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 
-from apps.lingbot.sage_attention import sage_attention
+from apps.lingbot.sage_attention import sage_attention, use_sage
 
 
 class SageAttentionTests(unittest.TestCase):
@@ -15,14 +15,31 @@ class SageAttentionTests(unittest.TestCase):
         value = torch.randn_like(key)
 
         def sage(q, k, v, **kwargs):
-            self.assertEqual(kwargs, dict(tensor_layout="NHD", is_causal=False, sm_scale=64 ** -0.5))
-            k.zero_()
-            return q.clone()
+            expected = dict(tensor_layout="NHD", is_causal=False, sm_scale=64 ** -0.5)
+            if kwargs.pop("smooth_k"):
+                k.sub_(k.mean(dim=1, keepdim=True))
+            self.assertEqual(kwargs, expected)
+            return k[:, :q.shape[1]].clone()
 
         with patch("apps.lingbot.sage_attention.load_sage", return_value=sage):
-            result = torch.compile(sage_attention, backend="eager", fullgraph=True)(query, key, value)
-        torch.testing.assert_close(result, query)
+            compiled = torch.compile(sage_attention, backend="eager", fullgraph=True)
+            result = compiled(query, key, value)
+            precentered = compiled(query, key, value, True)
+        torch.testing.assert_close(result, precentered, rtol=0, atol=0)
         torch.testing.assert_close(key, original)
+
+    def test_auto_prefers_sage_when_available(self):
+        device = torch.device("cuda")
+        with (patch("torch.cuda.get_device_capability", return_value=(12, 0)),
+              patch("apps.lingbot.sage_attention.load_sage") as load):
+            self.assertTrue(use_sage("auto", device, 128, eligible=True))
+            self.assertFalse(use_sage("cudnn", device, 128, eligible=True))
+            self.assertFalse(use_sage("auto", device, 128, eligible=False))
+            load.assert_called_once()
+            load.side_effect = RuntimeError("missing backend")
+            self.assertFalse(use_sage("auto", device, 128, eligible=True))
+            with self.assertRaisesRegex(RuntimeError, "missing backend"):
+                use_sage("sage", device, 128, eligible=True)
 
     def test_fake_and_empty(self):
         from torch._subclasses.fake_tensor import FakeTensorMode
