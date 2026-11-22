@@ -26,6 +26,11 @@ by default. Set `LB_COMPILE_REFINER=0` to disable refiner compilation (also off 
 `--eager` unless explicitly enabled) or `LB_REFINER_DIRECT_KV=0` to use staged writes.
 Multi-GPU runs keep staged writes.
 
+On one GPU with DiT compilation enabled, camera preparation compiles separate layer
+writes instead of passing the full camera buffer to each layer. Set `LB_DIT_CAMERA_SLICED=0`
+to restore full-buffer compilation or `LB_DIT_CAMERA_SLICED=1` to select per-layer writes
+explicitly. Per-layer writes require DiT compilation.
+
 Experimental settings (off unless specified):
 
 | Setting | Effect |
