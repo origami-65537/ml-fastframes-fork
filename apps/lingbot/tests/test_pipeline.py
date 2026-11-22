@@ -28,6 +28,13 @@ def test_only_configure_expandable_segments_by_default(monkeypatch, allocator_en
             settings.assert_called_once_with("expandable_segments:True")
 
 
+def test_cache_frames_must_keep_sink_frames():
+    minimum = pipeline.SINK_FRAMES + pipeline.CHUNK
+    pipeline._check_cache_frames(minimum)
+    with pytest.raises(ValueError, match="LB_CACHE_FRAMES"):
+        pipeline._check_cache_frames(minimum - 1)
+
+
 def test_repeated_image_encoding_moves_vae_back_to_device(monkeypatch):
     for name in ("HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH"):
         monkeypatch.setattr(conditioning, name, 2)
@@ -58,6 +65,14 @@ def test_graphs_cleared_before_park():
     assert mock.mock_calls == [call.dit.clear_graphs(), call.refiner.clear_graphs(), call.dit.model.cpu()]
 
 
+@pytest.fixture
+def upstream():
+    grid = torch.arange(1000)
+    scheduler = SimpleNamespace(timesteps=grid, sigmas=grid, set_timesteps=Mock())
+    dit = SimpleNamespace(patch_embedding=torch.nn.Linear(1, 1), blocks=[None], dim=1, num_heads=1)
+    return SimpleNamespace(dit=dit, scheduler=scheduler, config=SimpleNamespace(num_train_timesteps=1000))
+
+
 @pytest.mark.parametrize(
     ("world", "compile", "overrides", "expected"),
     [
@@ -67,16 +82,12 @@ def test_graphs_cleared_before_park():
         (8, True, {}, (True, False)),
     ],
 )
-def test_refiner_defaults_respect_eager_world_and_overrides(world, compile, overrides, expected, monkeypatch):
+def test_refiner_defaults_respect_eager_world_and_overrides(world, compile, overrides, expected, monkeypatch, upstream):
     for flag in ("LB_COMPILE_REFINER", "LB_REFINER_DIRECT_KV"):
         monkeypatch.delenv(flag, raising=False)
     for flag, value in overrides.items():
         monkeypatch.setenv(flag, value)
     monkeypatch.setenv("LB_STEPS", "2")
-    grid = torch.arange(1000)
-    scheduler = SimpleNamespace(timesteps=grid, sigmas=grid, set_timesteps=Mock())
-    dit = SimpleNamespace(patch_embedding=torch.nn.Linear(1, 1), blocks=[None], dim=1, num_heads=1)
-    upstream = SimpleNamespace(dit=dit, scheduler=scheduler, config=SimpleNamespace(num_train_timesteps=1000))
     with (patch.object(pipeline, "LingBotDiT"), patch.object(pipeline, "KVRefiner") as refiner,
           patch.object(pipeline, "CapturedDecoder"), patch.object(pipeline, "SpatialDecoder"),
           patch.object(pipeline, "rope_frequencies")):
@@ -84,6 +95,28 @@ def test_refiner_defaults_respect_eager_world_and_overrides(world, compile, over
                                    world=world, compile=compile, graphs=False)
     args = refiner.call_args.kwargs
     assert (args["compile"], args["direct_kv"]) == expected
+
+
+@pytest.mark.parametrize(("world", "graphs", "override", "expected"), [
+    (1, True, None, False),
+    (1, True, "1", True),
+    (8, True, None, True),
+    (8, True, "0", False),
+    (8, False, None, False),
+])
+def test_dit_graphs_default_and_overrides(world, graphs, override, expected, monkeypatch, upstream):
+    for flag in ("LB_GRAPHS_DIT", "LB_GRAPHS_REFINER", "LB_GRAPHS_DECODER", "LB_COMPILE_DIT"):
+        monkeypatch.delenv(flag, raising=False)
+    if override is not None:
+        monkeypatch.setenv("LB_GRAPHS_DIT", override)
+    decoder_cls = "CapturedDecoder" if world == 1 else "SpatialDecoder"
+    with (patch.object(pipeline, "LingBotDiT") as dit, patch.object(pipeline, "KVRefiner") as refiner,
+          patch.object(pipeline, decoder_cls) as decoder, patch.object(pipeline, "rope_frequencies")):
+        pipeline.FastFramesLingBot(pipeline.MODELS["lingbot-1.3b"], upstream, None, None, world=world, graphs=graphs)
+    assert dit.call_args.kwargs["graphs"] is expected
+    assert dit.call_args.kwargs["compile"] is True
+    assert refiner.call_args.kwargs["graphs"] is graphs
+    assert decoder.call_args.kwargs["graphs"] is graphs
 
 
 @pytest.mark.parametrize("value_dtype", [torch.bfloat16, torch.float16])

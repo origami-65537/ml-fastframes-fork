@@ -100,6 +100,11 @@ def load_decoder(path, config, device):
     return net.to(device, dtype=torch.bfloat16).eval().requires_grad_(False)
 
 
+def _check_cache_frames(cache_frames):
+    if cache_frames < SINK_FRAMES + CHUNK:
+        raise ValueError(f"LB_CACHE_FRAMES must be at least {SINK_FRAMES + CHUNK} (sink frames + one chunk)")
+
+
 class FastFramesLingBot:
     """One session at a time; under context parallelism every rank makes the same calls."""
 
@@ -107,6 +112,7 @@ class FastFramesLingBot:
                  graphs=True):
         if world not in (1, 8):
             raise ValueError("FastFrames-LingBot runs on 1 or 8 GPUs")
+        _check_cache_frames(CACHE_FRAMES)
         self.model, self.upstream, self.world, self.rank = model, upstream, world, rank
         dit = upstream.dit
         self.device = dit.patch_embedding.weight.device
@@ -131,7 +137,7 @@ class FastFramesLingBot:
         env = lambda name, default: os.environ.get(name, str(int(default))) == "1"  # noqa: E731
         self.dit = LingBotDiT(dit, self.cache_k, self.cache_v, context, self.timesteps, world=world, rank=rank,
                               split_kv=model.split_kv[world], compile=env("LB_COMPILE_DIT", compile),
-                              graphs=env("LB_GRAPHS_DIT", graphs))
+                              graphs=env("LB_GRAPHS_DIT", graphs and world != 1))
         result = self.dit.result
         heads_per_stream = int(os.environ.get("LB_REFINER_HEADS_PER_STREAM", model.kv_layers_per_stream[world]))
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
