@@ -1,5 +1,6 @@
 """Opt-in outer-call CUDA events; never patch the captured graph bodies."""
 from collections import defaultdict
+from contextlib import contextmanager
 
 from evaluation.bench.stats import sample_stats
 
@@ -21,6 +22,40 @@ class TimingProxy:
         return result
 
 
+STAGES = ("dit", "refiner", "decoder")
+
+
+class AnnotationProxy:
+    def __init__(self, target, label, record_function):
+        self.target, self.label, self.record_function = target, label, record_function
+
+    def __getattr__(self, name):
+        return getattr(self.target, name)
+
+    def __call__(self, *args, **kwargs):
+        with self.record_function(self.label):
+            return self.target(*args, **kwargs)
+
+
+@contextmanager
+def annotate_stages(pipe, prefix="bench_stage/"):
+    """Label each stage call so profiler kernels can be attributed through launch correlation."""
+    import torch
+
+    originals = {name: getattr(pipe, name) for name in STAGES}
+    try:
+        for name, target in originals.items():
+            setattr(pipe, name, AnnotationProxy(target, prefix + name, torch.profiler.record_function))
+        if hasattr(originals["dit"], "begin_chunk"):
+            # The camera branch runs in dit.begin_chunk, outside dit's own call.
+            pipe.dit.begin_chunk = AnnotationProxy(originals["dit"].begin_chunk, prefix + "dit.begin_chunk",
+                                                   torch.profiler.record_function)
+        yield
+    finally:
+        for name, target in originals.items():
+            setattr(pipe, name, target)
+
+
 def summarize_events(events):
     chunks = defaultdict(lambda: defaultdict(float))
     for name, chunk, start, end in events:
@@ -32,7 +67,7 @@ def summarize_events(events):
 def measure_stages(pipe, generate, chunk):
     import torch
 
-    originals = {name: getattr(pipe, name) for name in ("dit", "refiner", "decoder")}
+    originals = {name: getattr(pipe, name) for name in STAGES}
     events = []
     try:
         for name, target in originals.items():

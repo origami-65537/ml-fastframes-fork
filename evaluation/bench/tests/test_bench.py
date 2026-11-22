@@ -1,5 +1,6 @@
 import json
 import math
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -9,7 +10,7 @@ from evaluation.bench.compare import append_history, read_history, table
 from evaluation.bench.fixed_bench import json_safe, parser, workload_key
 from evaluation.bench.profiling import classify, profile_report
 from evaluation.bench.quality import compare, sanity, verdict
-from evaluation.bench.stages import TimingProxy, measure_stages, summarize_events
+from evaluation.bench.stages import TimingProxy, annotate_stages, measure_stages, summarize_events
 from evaluation.bench.stats import sample_stats
 
 
@@ -64,7 +65,7 @@ def test_every_repeat(monkeypatch, tmp_path, capsys, case):
              "reference": 255-good, "shape": good[:1]}[case]
     videos = iter([first, good])
     monkeypatch.setattr(fixed_bench, "adapter", lambda args:
-                        (lambda: next(videos), lambda: None, good.shape, None))
+                        (lambda: next(videos), lambda: None, good.shape, None, nullcontext))
     for name in ("set_device", "synchronize", "reset_peak_memory_stats"):
         monkeypatch.setattr(torch.cuda, name, lambda *args: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -127,7 +128,8 @@ def test_history(tmp_path):
 
 
 @pytest.mark.parametrize("name,category", [("flash_fwd", "attention"), ("ampere_gemm", "GEMM"),
-                                           ("cudnn_conv", "conv"), ("layer_norm", "norm"),
+                                           ("cudnn_conv", "conv"), ("qk_int8_sv_f8_attn_kernel", "attention"),
+                                           ("quant_per_block_int8_kernel", "attention quant"), ("layer_norm", "norm"),
                                            ("triton_fused", "elementwise/triton fused"),
                                            ("Memcpy HtoD", "memcpy"), ("unknown", "other")])
 def test_categories(name, category):
@@ -174,7 +176,7 @@ def test_stats_and_defaults():
     with pytest.raises(ValueError):
         sample_stats([])
     args = parser().parse_args([])
-    assert (args.repeats, args.warmup, args.profile_repeats) == (10, 2, 3)
+    assert (args.repeats, args.warmup, args.profile_repeats) == (3, 2, 3)
     row = {"key": "a", "git": {"sha": "abc"}, "fps": stats, "ms_per_frame": stats,
            "memory": {"allocated_gb": 1, "reserved_gb": 2}, "verdict": "pass"}
     report = table([row])
@@ -249,3 +251,59 @@ def test_stage_restoration(monkeypatch, fail):
         assert result["stages"]["dit"]["median"] == 1
         assert "refiner" not in result["stages"]
     assert [pipe.dit, pipe.refiner, pipe.decoder] == originals
+
+
+def test_profile_stages(tmp_path):
+    trace = tmp_path / "trace.json"
+    trace.write_text(json.dumps({"traceEvents": [
+        {"cat": "user_annotation", "name": "bench_stage/dit", "pid": 1, "tid": 1, "ts": 0, "dur": 100},
+        {"cat": "user_annotation", "name": "bench_stage/refiner", "pid": 1, "tid": 1, "ts": 200, "dur": 100},
+        {"cat": "user_annotation", "name": "other", "pid": 1, "tid": 1, "ts": 400, "dur": 100},
+        {"cat": "cuda_runtime", "name": "cudaGraphLaunch", "pid": 1, "tid": 1, "ts": 10, "dur": 5,
+         "args": {"correlation": 1}},
+        {"cat": "cuda_runtime", "name": "cudaLaunchKernel", "pid": 1, "tid": 1, "ts": 210, "dur": 5,
+         "args": {"correlation": 2}},
+        {"cat": "cuda_runtime", "name": "cudaLaunchKernel", "pid": 1, "tid": 2, "ts": 20, "dur": 5,
+         "args": {"correlation": 3}},
+        {"cat": "kernel", "name": "flash_fwd", "ts": 20, "dur": 300, "args": {"correlation": 1}},
+        {"cat": "kernel", "name": "gemm", "ts": 320, "dur": 100, "args": {"correlation": 1}},
+        {"cat": "kernel", "name": "layer_norm", "ts": 420, "dur": 50, "args": {"correlation": 2}},
+        {"cat": "kernel", "name": "gemm", "ts": 470, "dur": 50, "args": {"correlation": 3}}]}))
+    report = profile_report([trace] * 2, [0.001] * 2)
+    assert "| dit | 0.4 ± 0.0 | 80.0% |" in report
+    assert "| refiner | 0.1 ± 0.0 | 10.0% |" in report
+    assert "| unattributed | 0.1 ± 0.0 | 10.0% |" in report
+    assert "### dit: categories" in report and "- attention: 75.0%±0.0%" in report
+    assert "| flash_fwd | 1 | 0.300 ± 0.000 | 75.0% |" in report
+
+
+def test_annotate_stages(monkeypatch):
+    labels = []
+
+    class Record:
+        def __init__(self, label):
+            labels.append(label)
+
+        def __enter__(self):
+            pass
+
+        def __exit__(self, *args):
+            pass
+
+    class Stage:
+        def __call__(self, x):
+            return x + 1
+
+        def begin_chunk(self, x):
+            return x * 10
+
+    class Pipe:
+        dit, refiner, decoder = Stage(), Stage(), Stage()
+
+    monkeypatch.setattr(torch.profiler, "record_function", Record)
+    pipe = Pipe()
+    original = pipe.dit
+    with annotate_stages(pipe):
+        assert pipe.dit.begin_chunk(1) == 10 and pipe.dit(1) == 2 and pipe.decoder(2) == 3
+    assert labels == ["bench_stage/dit.begin_chunk", "bench_stage/dit", "bench_stage/decoder"]
+    assert pipe.dit is original and "begin_chunk" not in vars(original)

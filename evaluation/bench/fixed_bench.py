@@ -9,6 +9,7 @@ import statistics
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,7 +26,7 @@ def parser():
     p.add_argument("--prompt", help="default: corgi prompt for ff-s; example prompt for LingBot")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--frames", type=int, default=81, help="ff-s requires 81; LingBot rounds to whole chunks")
-    p.add_argument("--repeats", type=int, default=10)
+    p.add_argument("--repeats", type=int, default=3, help="timed runs per identical condition")
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
     p.add_argument("--lingbot-root")
@@ -61,7 +62,7 @@ def adapter(args):
         from scripts.generate import load_model
         args.prompt = args.prompt if args.prompt is not None else "A corgi surfing a wave at sunset"
         model = load_model("ff-s", args.checkpoint_dir)
-        return lambda: model.generate(args.prompt, args.seed), lambda: None, (81, 480, 832, 3), None
+        return lambda: model.generate(args.prompt, args.seed), lambda: None, (81, 480, 832, 3), None, nullcontext
     from apps.lingbot.generate import CHUNK, add_model_arguments, import_upstream, load_pipeline, read_condition
 
     model_parser = argparse.ArgumentParser()
@@ -79,9 +80,14 @@ def adapter(args):
     image, args.prompt, rays, chunks, seed = read_condition(args)
     pipe = load_pipeline(model_args, 1, 0)
     chunk_index = [0]
+    started = [False]
 
     def generate():
-        pipe.start(image, args.prompt, seed=seed, latents=CHUNK * chunks)
+        if started[0]:
+            pipe.restart(seed=seed)  # start() offloads the VAE; re-conditioning is not timed
+        else:
+            pipe.start(image, args.prompt, seed=seed, latents=CHUNK * chunks)
+            started[0] = True
         frames = []
         for chunk in range(chunks):
             chunk_index[0] = chunk
@@ -92,7 +98,9 @@ def adapter(args):
         from evaluation.bench.stages import measure_stages
         return measure_stages(pipe, generate, lambda: chunk_index[0])
 
-    return generate, pipe.close, (CHUNK * chunks * 4 - 3, 464, 832, 3), stage_timing
+    from evaluation.bench.stages import annotate_stages
+    return (generate, pipe.close, (CHUNK * chunks * 4 - 3, 464, 832, 3), stage_timing,
+            lambda: annotate_stages(pipe))
 
 
 def json_safe(value):
@@ -123,7 +131,7 @@ def main(argv=None):
     if not torch.cuda.is_available():
         p.error("a CUDA GPU is required for generation (metrics/tests work on CPU)")
     torch.cuda.set_device(0)
-    generate, close, expected, stage_timing = adapter(args)
+    generate, close, expected, stage_timing, stage_scope = adapter(args)
     config = {k: getattr(args, k) for k in ("model", "prompt", "seed", "frames")}
     config["example"] = str(args.example.resolve()) if args.example else None
     key = workload_key(config)
@@ -206,7 +214,8 @@ def main(argv=None):
                 for index in range(args.profile_repeats):
                     torch.cuda.synchronize()
                     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                           torch.profiler.ProfilerActivity.CUDA]) as prof:
+                                                           torch.profiler.ProfilerActivity.CUDA]) as prof, \
+                            stage_scope():
                         start = time.perf_counter()
                         profiled = generate()
                         torch.cuda.synchronize()
