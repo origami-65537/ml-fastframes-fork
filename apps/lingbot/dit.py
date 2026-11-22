@@ -150,7 +150,9 @@ class LingBotDiT:
     """
 
     def __init__(self, model, cache_k, cache_v, context, timesteps, *, world=1, rank=0, split_kv=1,
-                 compile=True, graphs=True):
+                 compile=True, graphs=True, camera_sliced=False):
+        if camera_sliced and not compile:
+            raise ValueError("LB_DIT_CAMERA_SLICED=1 requires DiT compilation")
         self.model, self.cache_k, self.cache_v = model, cache_k, cache_v
         self.world, self.rank = int(world), int(rank)
         self.dim, self.heads = model.dim, model.num_heads
@@ -236,7 +238,7 @@ class LingBotDiT:
             if not compile:
                 return fn
             return torch.compile(fn, dynamic=False, fullgraph=True, mode="max-autotune-no-cudagraphs")
-        if compile and os.environ.get("LB_DIT_CAMERA_SLICED") == "1":
+        if camera_sliced:
             self._camera_project_run = compiled(self._project_camera)
             self._camera_layer_run = compiled(_write_camera_layer)
             self._camera_run = self._prepare_camera_sliced

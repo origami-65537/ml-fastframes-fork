@@ -109,6 +109,32 @@ def upstream():
     return SimpleNamespace(dit=dit, scheduler=scheduler, config=SimpleNamespace(num_train_timesteps=1000))
 
 
+@pytest.mark.parametrize(("world", "compile", "env", "expected"), [
+    (1, True, {}, True),
+    (1, False, {}, False),
+    (8, True, {}, False),
+    (1, True, {"LB_COMPILE_DIT": "0"}, False),
+    (1, False, {"LB_COMPILE_DIT": "1"}, True),
+    (1, True, {"LB_DIT_CAMERA_SLICED": "0"}, False),
+])
+def test_sliced_camera_defaults_to_single_gpu_with_compiled_dit(world, compile, env, expected, monkeypatch, upstream):
+    for flag in ("LB_DIT_CAMERA_SLICED", "LB_COMPILE_DIT"):
+        monkeypatch.delenv(flag, raising=False)
+    for flag, value in env.items():
+        monkeypatch.setenv(flag, value)
+    with (patch.object(pipeline, "LingBotDiT") as runner, patch.object(pipeline, "KVRefiner"),
+          patch.object(pipeline, "CapturedDecoder"), patch.object(pipeline, "SpatialDecoder"),
+          patch.object(pipeline, "rope_frequencies")):
+        pipeline.FastFramesLingBot(pipeline.MODELS["lingbot-1.3b"], upstream, None, None,
+                                   world=world, compile=compile, graphs=False)
+    assert runner.call_args.kwargs["camera_sliced"] is expected
+
+
+def test_explicitly_sliced_camera_requires_dit_compilation():
+    with pytest.raises(ValueError, match="requires DiT compilation"):
+        dit.LingBotDiT(None, None, None, None, (), compile=False, camera_sliced=True)
+
+
 @pytest.mark.parametrize(
     ("world", "compile", "overrides", "expected"),
     [

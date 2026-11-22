@@ -23,6 +23,11 @@ by default. Set `LB_COMPILE_REFINER=0` to disable refiner compilation (also off 
 `--eager` unless explicitly enabled) or `LB_REFINER_DIRECT_KV=0` to use staged writes.
 Multi-GPU runs keep staged writes.
 
+On one GPU with DiT compilation enabled, camera preparation compiles separate layer
+writes instead of passing the full camera buffer to each layer. Set `LB_DIT_CAMERA_SLICED=0`
+to restore full-buffer compilation or `LB_DIT_CAMERA_SLICED=1` to select per-layer writes
+explicitly. Per-layer writes require DiT compilation.
+
 Experimental settings (off unless specified):
 
 | Setting | Effect |
@@ -30,7 +35,6 @@ Experimental settings (off unless specified):
 | `LB_FP8=1`, `ffn`, or `attention` | Opt in to dynamically scaled FP8 for the selected DiT linears. Defaults to `0` (BF16). Cross-attention K/V stay BF16. |
 | `LB_ATTN_CROSS=sage` | Use SageAttention for cross-attention on one GPU. |
 | `LB_SAGE_PRECENTER=1` | Center SageAttention keys out of place instead of cloning and then centering. |
-| `LB_DIT_CAMERA_SLICED=1` | With DiT compilation enabled, compile camera writes per layer so the compiler sees only one destination slice. |
 | `LB_REFINER_FUSED_EPILOGUE=1` | Compile the KV repair, RoPE and cache-write epilogues but leave refiner GEMMs eager. Requires direct KV writes and `LB_COMPILE_REFINER=0`. |
 | `LB_REFINER_HEADS_PER_STREAM=N` | Group N DiT layers per refiner CUDA stream; N must divide the layer count. |
 
