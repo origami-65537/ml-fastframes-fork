@@ -7,7 +7,7 @@ import torch
 
 from evaluation.bench import fixed_bench
 from evaluation.bench.compare import append_history, read_history, table
-from evaluation.bench.fixed_bench import fps_gate, json_safe, max_abs_diff, parser, workload_key
+from evaluation.bench.fixed_bench import fps_baseline, fps_gate, json_safe, max_abs_diff, parser, workload_key
 from evaluation.bench.profiling import classify, correlation_stages, profile_report
 from evaluation.bench.quality import compare, sanity, verdict
 from evaluation.bench.stages import TimingProxy, annotate_stages, measure_stages, summarize_events
@@ -374,11 +374,16 @@ def test_fps_gate_and_repeat_diff():
     steady, noisy = sample_stats([10, 10.1, 10.05]), sample_stats([8, 10, 12])
     previous = {"fps": steady, "git": {"sha": "abc"}}
     assert fps_gate(steady, previous, None, 0.02) == {"status": "off"}
-    assert fps_gate(steady, None, 0.1, 0.02) == {"status": "no-previous"}
+    assert fps_gate(steady, None, 0.1, 0.02)["status"] == "no-previous"
+    assert fps_gate(noisy, None, 0.1, 0.02)["status"] == "low-confidence"
     assert fps_gate(steady, previous, 0.1, 0.02)["status"] == "gated"
     assert fps_gate(noisy, previous, 0.1, 0.02)["status"] == "low-confidence"
-    assert fps_gate(steady, {"fps": noisy, "git": {"sha": "abc"}}, 0.1, 0.02)["status"] == "low-confidence"
     assert fps_gate(steady, {"fps": {"median": 10}, "git": {"sha": "abc"}}, 0.1, 0.02)["status"] == "gated"
+    history = [{"key": "k", "fps": steady, "id": 1}, {"key": "other", "fps": steady, "id": 2},
+               {"key": "k", "fps": noisy, "id": 3}]
+    assert fps_baseline(history, "k", 0.02)["id"] == 1
+    assert fps_baseline(history, "k", 1.0)["id"] == 3
+    assert fps_baseline(history[2:], "k", 0.02) is None
     a = torch.tensor([[0, 255], [10, 20]], dtype=torch.uint8)
     b = torch.tensor([[3, 250], [10, 20]], dtype=torch.uint8)
     assert max_abs_diff(a, b) == 5 and max_abs_diff(b, a) == 5
@@ -398,7 +403,7 @@ def fake_bench(monkeypatch, generate=None, timing_scope=None):
 
 
 def test_timing_scope_changes_key(monkeypatch, tmp_path):
-    keys = {}
+    keys, reference_keys = {}, set()
     for scope in (None, "steps only (start untimed)"):
         fake_bench(monkeypatch, timing_scope=scope)
         history = tmp_path / f"{scope is None}.jsonl"
@@ -406,9 +411,47 @@ def test_timing_scope_changes_key(monkeypatch, tmp_path):
                           "--reference-dir", str(tmp_path / "ref"), "--run-dir", str(tmp_path / "runs")])
         record = read_history(history)[0]
         keys[scope] = record["key"]
+        reference_keys.add(record["reference_key"])
         assert record["timing_scope"] == (scope or "full generate()")
         assert record["config"].get("timing_scope") == scope
     assert keys[None] != keys["steps only (start untimed)"]
+    assert reference_keys == {keys[None]}
+
+
+def test_reference_survives_timing_scope(monkeypatch, tmp_path):
+    import fastframes.video
+
+    fake_bench(monkeypatch)
+    monkeypatch.setattr(fastframes.video, "save_video", lambda path, video: None)
+    argv = ["--warmup", "0", "--repeats", "1", "--reference-dir", str(tmp_path / "ref"),
+            "--run-dir", str(tmp_path / "runs")]
+    fixed_bench.main(argv + ["--history", str(tmp_path / "base.jsonl"), "--save-reference"])
+    worse = lambda: torch.full((2, 12, 12, 3), 128, dtype=torch.uint8) | 1  # noqa: E731
+    fake_bench(monkeypatch, generate=worse, timing_scope="steps only (start untimed)")
+    history = tmp_path / "candidate.jsonl"
+    assert fixed_bench.main(argv + ["--history", str(history)]) == 1
+    record = read_history(history)[0]
+    assert record["verdict"] == "fail" and record["quality"]
+
+
+def test_noisy_run_never_becomes_baseline(monkeypatch, tmp_path):
+    fake_bench(monkeypatch)
+    monkeypatch.setattr(fixed_bench, "workload_key", lambda config: "test")
+    history = tmp_path / "history.jsonl"
+    append_history(history, {"key": "test", "git": {"sha": "base"}, "fps": sample_stats([100.0] * 3)})
+    argv = ["--warmup", "0", "--history", str(history), "--max-fps-drop", "0.1",
+            "--reference-dir", str(tmp_path / "ref"), "--run-dir", str(tmp_path / "runs")]
+    statuses = []
+    for seconds in ([2 / 70, 2 / 80, 2 / 90], [2 / 80] * 3):  # 2-frame fake video
+        times = iter([t for s in seconds for t in (0.0, s)])
+        monkeypatch.setattr(fixed_bench.time, "perf_counter", lambda: next(times))
+        result = fixed_bench.main(argv)
+        record = read_history(history)[-1]
+        statuses.append((record["fps_gate"]["status"], result))
+        if record["fps_gate"]["status"] == "gated":
+            assert record["fps_gate"]["previous_sha"] == "base"
+    # The noisy 80 fps run is skipped; the steady rerun still compares against the 100 fps baseline.
+    assert statuses == [("low-confidence", 0), ("gated", 1)]
 
 
 @pytest.mark.parametrize("seconds,expected", [([1.0, 1.0, 1.0], "gated"), ([1.0, 1.2, 0.8], "low-confidence")])

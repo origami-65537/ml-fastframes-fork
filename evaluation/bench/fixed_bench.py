@@ -46,7 +46,8 @@ def parser():
     p.add_argument("--constant-eps", type=float, default=1e-6)
     p.add_argument("--max-fps-drop", type=float, help="allowed fractional drop vs last same-key run, e.g. 0.1")
     p.add_argument("--max-fps-cv", type=float, default=0.02,
-                   help="skip the fps gate as LOW-CONFIDENCE when this or the previous run's fps CV exceeds it")
+                   help="skip the fps gate as LOW-CONFIDENCE when this run's fps CV exceeds it; "
+                        "noisier runs are never baselines")
     p.add_argument("--profile", action="store_true")
     p.add_argument("--profile-repeats", type=int, default=3)
     p.add_argument("--stage-timing", action="store_true", help="extra LingBot CUDA-event diagnostic generation")
@@ -119,15 +120,21 @@ def max_abs_diff(video, previous):
     return float((torch.maximum(video, previous) - torch.minimum(video, previous)).max())
 
 
+def fps_baseline(history, key, max_cv):
+    """Latest same-key run steady enough to be an fps baseline; noisy runs stay in history but never gate."""
+    return next((r for r in reversed(history) if r["key"] == key and r["fps"].get("cv", 0.0) <= max_cv), None)
+
+
 def fps_gate(fps, previous, max_fps_drop, max_cv):
     """Decide whether the fps drop gate may use these samples; noisy runs are reported, not gated."""
     if max_fps_drop is None:
         return {"status": "off"}
+    if fps["cv"] > max_cv:
+        return {"status": "low-confidence", "cv": {"current": fps["cv"]}, "max_cv": max_cv}
     if previous is None:
-        return {"status": "no-previous"}
-    cvs = {"current": fps["cv"], "previous": previous["fps"].get("cv", 0.0)}
-    status = "low-confidence" if max(cvs.values()) > max_cv else "gated"
-    return {"status": status, "cv": cvs, "max_cv": max_cv, "previous_sha": previous["git"]["sha"]}
+        return {"status": "no-previous", "max_cv": max_cv}
+    return {"status": "gated", "cv": {"current": fps["cv"], "previous": previous["fps"].get("cv", 0.0)},
+            "max_cv": max_cv, "previous_sha": previous["git"]["sha"]}
 
 
 def json_safe(value):
@@ -163,6 +170,8 @@ def main(argv=None):
     generate, close, expected, stage_timing, stage_scope, timing_scope = adapter(args)
     config = {k: getattr(args, k) for k in ("model", "prompt", "seed", "frames")}
     config["example"] = str(args.example.resolve()) if args.example else None
+    # References depend only on what is generated; history keys also separate timing semantics.
+    reference_key = workload_key(config)
     if timing_scope:
         config["timing_scope"] = timing_scope
     key = workload_key(config)
@@ -181,7 +190,7 @@ def main(argv=None):
                 warmup = generate()
                 torch.cuda.synchronize()
                 del warmup
-            refpath = args.reference_dir / f"{key}.pt"
+            refpath = args.reference_dir / f"{reference_key}.pt"
             has_reference = refpath.exists()
             reference = torch.load(refpath, map_location="cpu", weights_only=True) if has_reference else None
             if not has_reference and not args.save_reference:
@@ -229,7 +238,7 @@ def main(argv=None):
                     has_reference = True
                     reference_saved = True
             del video, reference
-            previous = next((r for r in reversed(read_history(args.history)) if r["key"] == key), None)
+            previous = fps_baseline(read_history(args.history), key, args.max_fps_cv)
             fps_stats = sample_stats(fps)
             gate = fps_gate(fps_stats, previous, args.max_fps_drop, args.max_fps_cv)
             gated = gate["status"] == "gated"
@@ -253,7 +262,7 @@ def main(argv=None):
                       "repeat_quality": repeat_quality,
                       "repeat_max_abs_diff": max(diffs) if diffs else None,
                       "verdict": status, "reasons": reasons,
-                      "reference": str(refpath), "reference_saved": reference_saved}
+                      "reference": str(refpath), "reference_key": reference_key, "reference_saved": reference_saved}
             if args.profile:
                 traces, walls = [], []
                 for index in range(args.profile_repeats):
@@ -283,8 +292,10 @@ def main(argv=None):
                 for name, stats in record["stage_timing"]["stages"].items():
                     print(f"{name}: {stats['median']:.3f} median ms/chunk ({len(stats['samples'])} chunks)")
             if gate["status"] == "low-confidence":
-                print(f"LOW-CONFIDENCE: fps CV {gate['cv']['current']:.2%} (previous "
-                      f"{gate['cv']['previous']:.2%}) exceeds {args.max_fps_cv:.2%}; fps drop gate skipped")
+                print(f"LOW-CONFIDENCE: fps CV {gate['cv']['current']:.2%} exceeds {args.max_fps_cv:.2%}; "
+                      "fps drop gate skipped and this run is not used as a later baseline")
+            elif gate["status"] == "no-previous":
+                print(f"No same-key run with fps CV <= {args.max_fps_cv:.2%}; fps drop gate skipped")
             if diffs:
                 print(f"Max |delta| between consecutive repeats: {max(diffs):.0f}")
             for reason in reasons:
