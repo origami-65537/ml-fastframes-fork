@@ -6,7 +6,6 @@ import torch
 from PIL import Image
 
 from apps.lingbot import conditioning, dit, pipeline, refiner
-from fastframes.models.kv_refinement import KVRefinementNetwork
 
 
 @pytest.mark.parametrize("allocator_env", [None, "PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"])
@@ -205,38 +204,6 @@ def test_direct_refiner_commit_matches_staged_commit(monkeypatch):
     r.cache_v.zero_()
     r.local = None
     r.direct_kv = True
-    r.epilogue = None
     run_heads()
-    torch.testing.assert_close(r.cache_k, expected_k, rtol=0, atol=0)
-    torch.testing.assert_close(r.cache_v, expected_v, rtol=0, atol=0)
-
-
-@torch.no_grad()
-def test_refiner_epilogue_matches_unfused_direct_write(monkeypatch):
-    monkeypatch.setattr(refiner, "TOKENS", 4)
-    monkeypatch.setattr(refiner, "FRAME_TOKENS", 2)
-    net = KVRefinementNetwork(8, 2, 4, 3, d_a=8).to(torch.bfloat16)
-    group = net.heads_grouped.gemms[0]
-    group.dK_w.normal_(std=0.02)
-    group.dV_w.normal_(std=0.02)
-    group.v_logscale.normal_(std=0.1)
-    r = refiner.KVRefiner.__new__(refiner.KVRefiner)
-    r.local_tokens = 4
-    r.cache_k = torch.zeros(3, 1, 8, 2, 4, dtype=torch.bfloat16)
-    r.cache_v = torch.zeros_like(r.cache_k)
-    r.k, r.v = (torch.randn(3, 4, 8, dtype=torch.bfloat16) for _ in range(2))
-    r.rope = torch.randn(4, 1, 2, 2)
-    r.direct_kv = True
-    r.write_key = refiner._write_refined_key
-    r.epilogue = None
-    head = refiner._Heads(net, torch.randn(1, 8, dtype=torch.bfloat16), 1, 3)
-    phi = torch.randn(4, 8, dtype=torch.bfloat16)
-    r._refine(head, 1, 3, phi, 0, 4, 3)
-    expected_k, expected_v = r.cache_k.clone(), r.cache_v.clone()
-    r.cache_k.zero_()
-    r.cache_v.zero_()
-    r.epilogue = tuple(torch.compile(fn, backend="aot_eager", fullgraph=True)
-                       for fn in (refiner._write_updated_key, refiner._write_updated_value))
-    r._refine(head, 1, 3, phi, 0, 4, 3)
     torch.testing.assert_close(r.cache_k, expected_k, rtol=0, atol=0)
     torch.testing.assert_close(r.cache_v, expected_v, rtol=0, atol=0)

@@ -35,7 +35,6 @@ Experimental settings (off unless specified):
 | `LB_FP8=1`, `ffn`, or `attention` | Opt in to dynamically scaled FP8 for the selected DiT linears. Defaults to `0` (BF16). Cross-attention K/V stay BF16. |
 | `LB_ATTN_CROSS=sage` | Use SageAttention for cross-attention on one GPU. |
 | `LB_SAGE_PRECENTER=1` | Center SageAttention keys out of place instead of cloning and then centering. |
-| `LB_REFINER_FUSED_EPILOGUE=1` | Compile the KV repair, RoPE and cache-write epilogues but leave refiner GEMMs eager. Requires direct KV writes and `LB_COMPILE_REFINER=0`. |
 | `LB_REFINER_HEADS_PER_STREAM=N` | Group N DiT layers per refiner CUDA stream; N must divide the layer count. |
 
 On the RTX 5060 Ti 16 GB fixed benchmark (832 × 464, 77 output frames), all three FP8

@@ -77,48 +77,23 @@ class _Heads(torch.nn.Module):
         self.register_buffer("scale", scale[lo:hi].detach())
         self.register_buffer("vscale", group.v_logscale[lo:hi].exp().detach())
 
-    def _hidden(self, k, v, phi):
+    def forward(self, k, v, phi):
         pk = torch.baddbmm(self.proj_k_b, k, self.proj_k_w)
         pv = torch.baddbmm(self.proj_v_b, v, self.proj_v_w)
         h = torch.baddbmm(self.fuse_b, torch.cat((pk, pv, phi[None].expand(self.count, -1, -1)), -1), self.fuse_w)
         h = F.layer_norm(h, (h.shape[-1],)) * (1 + self.scale) + self.shift
         h = torch.baddbmm(self.m0_b, h, self.m0_w)
-        return torch.baddbmm(self.m2_b, F.gelu(h, approximate="tanh"), self.m2_w)
-
-    def forward(self, k, v, phi):
-        h = self._hidden(k, v, phi)
-        kr = _repair_key(k, torch.baddbmm(self.dK_b, h, self.dK_w), self.heads, self.head_dim).reshape_as(k)
-        vr = _repair_value(v, torch.baddbmm(self.dV_b, h, self.dV_w), self.vscale)
+        h = torch.baddbmm(self.m2_b, F.gelu(h, approximate="tanh"), self.m2_w)
+        kr = k + torch.baddbmm(self.dK_b, h, self.dK_w)
+        shaped = kr.reshape(self.count, -1, self.heads, self.head_dim)
+        ref = k.reshape(self.count, -1, self.heads, self.head_dim)
+        kr = (shaped * (ref.norm(dim=-1, keepdim=True) / (shaped.norm(dim=-1, keepdim=True) + 1e-6))).reshape_as(k)
+        vr = (v + torch.baddbmm(self.dV_b, h, self.dV_w)) * self.vscale
         return kr, vr
-
-    def write(self, k, v, phi, rope, dst_k, dst_v, epilogue):
-        h = self._hidden(k, v, phi)
-        write_k, write_v = epilogue
-        write_k(k, torch.baddbmm(self.dK_b, h, self.dK_w), rope, dst_k)
-        write_v(v, torch.baddbmm(self.dV_b, h, self.dV_w), self.vscale, dst_v)
-
-
-def _repair_key(key, delta, heads, head_dim):
-    shaped = (key + delta).unflatten(-1, (heads, head_dim))
-    ref = key.unflatten(-1, (heads, head_dim))
-    return shaped * (ref.norm(dim=-1, keepdim=True) / (shaped.norm(dim=-1, keepdim=True) + 1e-6))
-
-
-def _repair_value(value, delta, scale):
-    return (value + delta) * scale
 
 
 def _write_refined_key(key, rope, destination):
     destination.copy_(rope_real(key, rope).reshape_as(destination))
-
-
-def _write_updated_key(key, delta, rope, destination):
-    repaired = _repair_key(key, delta, destination.shape[-2], destination.shape[-1])
-    _write_refined_key(repaired, rope, destination)
-
-
-def _write_updated_value(value, delta, scale, destination):
-    destination.copy_(_repair_value(value, delta, scale).reshape_as(destination))
 
 
 class KVRefiner:
@@ -129,15 +104,13 @@ class KVRefiner:
     """
 
     def __init__(self, net, patch, cache_k, cache_v, key, value, timestep, *, world=1, rank=0,
-                 heads_per_stream=None, direct_kv=False, fused_epilogue=False, compile=True, graphs=True):
+                 heads_per_stream=None, direct_kv=False, compile=True, graphs=True):
         import torch._inductor.config as inductor_config
         inductor_config.emulate_precision_casts = True
         if world not in (1, 8):
             raise ValueError("KV refinement supports 1 or 8 GPUs")
         if direct_kv and world != 1:
             raise ValueError("direct KV refinement requires one GPU")
-        if fused_epilogue and (not direct_kv or compile):
-            raise ValueError("LB_REFINER_FUSED_EPILOGUE requires LB_REFINER_DIRECT_KV=1 and LB_COMPILE_REFINER=0")
         layers, dim = net.num_blocks, net.dim
         heads_per_stream = layers if heads_per_stream is None else heads_per_stream
         if heads_per_stream < 1 or layers % heads_per_stream:
@@ -166,8 +139,6 @@ class KVRefiner:
         self.rotate = compiled(rope_real)
         self.write_key = compiled(_write_refined_key)
         self.commit = compiled(self._commit)
-        self.epilogue = (tuple(torch.compile(fn, fullgraph=True, dynamic=False)
-                               for fn in (_write_updated_key, _write_updated_value)) if fused_epilogue else None)
         self.streams = [torch.cuda.Stream(device=device) for _ in self.heads] if len(self.heads) > 1 else []
         self.local_tokens = TOKENS // world
         self.local = (None if direct_kv else
@@ -183,21 +154,17 @@ class KVRefiner:
         self.cache_v[:, :, end - TOKENS:end].copy_(value.reshape(shape))
 
     def _refine(self, head, first, last, phi, lo, hi, read_frames):
-        k, v = self.k[first:last, lo:hi], self.v[first:last, lo:hi]
-        rope = self.rope[lo:hi]
+        kr, vr = head(self.k[first:last, lo:hi], self.v[first:last, lo:hi], phi)
+        heads = self.cache_k.shape[-2]
+        kr = kr.reshape(last - first, self.local_tokens, heads, -1)
         if self.direct_kv:
             end = read_frames * FRAME_TOKENS
             dst_k = self.cache_k[first:last, :, end - TOKENS:end]
             dst_v = self.cache_v[first:last, :, end - TOKENS:end]
-            if self.epilogue is not None:
-                head.write(k, v, phi, rope, dst_k, dst_v, self.epilogue)
-                return
-            kr, vr = head(k, v, phi)
-            self.write_key(kr.reshape(last - first, self.local_tokens, *dst_k.shape[-2:]), rope, dst_k)
+            self.write_key(kr, self.rope[lo:hi], dst_k)
             dst_v.copy_(vr.reshape_as(dst_v))
             return
-        kr, vr = head(k, v, phi)
-        physical = self.rotate(kr.reshape(last - first, self.local_tokens, *self.cache_k.shape[-2:]), rope)
+        physical = self.rotate(kr, self.rope[lo:hi])
         self.local[0, first:last].copy_(physical.reshape(last - first, self.local_tokens, self.dim))
         self.local[1, first:last].copy_(vr)
 
