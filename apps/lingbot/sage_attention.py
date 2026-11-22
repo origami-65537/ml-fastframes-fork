@@ -55,7 +55,7 @@ def sage_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
         if not precenter:
             prepared.sub_(prepared.mean(dim=1, keepdim=True))
         quantize, attend = _fp16_v_kernels(query.shape[-1])
-        q, k, q_scale, k_scale = quantize(query, prepared, sm_scale=scale, tensor_layout="NHD")
+        q, q_scale, k, k_scale = quantize(query, prepared, sm_scale=scale, tensor_layout="NHD")
         return attend(q, k, value, q_scale, k_scale, tensor_layout="NHD", output_dtype=query.dtype)
     return load_sage()(query, prepared, value, tensor_layout="NHD", is_causal=False, smooth_k=not precenter,
                        sm_scale=scale)

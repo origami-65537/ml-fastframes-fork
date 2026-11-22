@@ -50,16 +50,22 @@ class SageAttentionTests(unittest.TestCase):
         fp16_cache[:, :6].copy_(value[:, :6])
         fp16_cache[:, 6:].copy_(value[:, 6:])
         centered = key - key.mean(dim=1, keepdim=True)
+        q_int8, k_int8 = query.to(torch.int8), centered.to(torch.int8)
+        expected_q_scale, expected_k_scale = torch.ones(1), torch.ones(2)
 
         def quantize(q, k, *, sm_scale, tensor_layout):
             self.assertEqual(sm_scale, 64 ** -0.5)
             self.assertEqual(tensor_layout, "NHD")
             torch.testing.assert_close(q, query, rtol=0, atol=0)
             torch.testing.assert_close(k, centered, rtol=0, atol=0)
-            return q, k, None, None
+            return q_int8, expected_q_scale, k_int8, expected_k_scale
 
         def attend(q, k, v, q_scale, k_scale, *, tensor_layout, output_dtype):
             self.assertEqual(tensor_layout, "NHD")
+            self.assertIs(q, q_int8)
+            self.assertIs(k, k_int8)
+            self.assertIs(q_scale, expected_q_scale)
+            self.assertIs(k_scale, expected_k_scale)
             self.assertEqual(v.data_ptr(), fp16_cache.data_ptr())
             torch.testing.assert_close(v, value.to(torch.float16), rtol=0, atol=0)
             return v[:, :q.shape[1]].to(output_dtype)
