@@ -30,7 +30,7 @@ from torchvision.io import write_png
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from fastframes.pipeline import CONTEXT_MODES, MODELS, FastFrames, configure_backends, to_uint8  # noqa: E402
+from fastframes.pipeline import CONTEXT_MODES, MODELS, FastFrames, to_uint8  # noqa: E402
 from fastframes.video import save_video  # noqa: E402
 from fastframes.wan.vae import VideoVAE  # noqa: E402
 
@@ -90,9 +90,7 @@ def main():
     stills = [float(t) for t in args.stills.split(",") if t]
     spec, root = MODELS[args.model], args.checkpoint_dir
     config = dataclasses.replace(spec.config, noise=args.noise or PAGE_NOISE[args.model])
-    configure_backends(config)
-    model = FastFrames.from_pretrained(config, root / spec.wan_dir, root / spec.dit, root / spec.refiner,
-                                       root / spec.decoder)
+    model = FastFrames.from_spec(spec, root, config)
     decode = make_decoder(args, model, root / spec.wan_dir)
     out = args.output_dir
     (out / "stills" if stills else out).mkdir(parents=True, exist_ok=True)
