@@ -28,6 +28,21 @@ writes instead of passing the full camera buffer to each layer. Set `LB_DIT_CAME
 to restore full-buffer compilation or `LB_DIT_CAMERA_SLICED=1` to select per-layer writes
 explicitly. Per-layer writes require DiT compilation.
 
+Runtime settings. The pipeline resolves every `LB_*` variable once, when it is constructed,
+into `LingBotRuntimeConfig` (`apps/lingbot/pipeline.py`), and keeps the result as `pipe.runtime`.
+Pass `runtime=LingBotRuntimeConfig(...)` to `FastFramesLingBot` to bypass the environment.
+Boolean settings are on only for `1`. `--eager` (`compile=False, graphs=False`) sets the default of each
+`LB_COMPILE_*` and `LB_GRAPHS_*` setting; an explicit variable overrides that default.
+
+| Setting | Effect |
+|---|---|
+| `LB_STEPS=N` | Number of denoising steps, evenly spaced over timestep indices 0–750 of the official schedule. Defaults to `4`. |
+| `LB_CACHE_FRAMES=N` | Rolling KV cache length in latent frames, including the current chunk. Defaults to `18`; must be at least `10` (6 sink frames + one chunk). |
+| `LB_COMPILE_DIT=0` or `1` | Compile the DiT. Defaults to on unless `--eager`. |
+| `LB_GRAPHS_REFINER=0` or `1` | Capture refiner CUDA graphs. Defaults to on unless `--eager`. |
+| `LB_COMPILE_DECODER=0` or `1` | Compile the pixel decoder. Defaults to on unless `--eager`. |
+| `LB_GRAPHS_DECODER=0` or `1` | Capture pixel-decoder CUDA graphs. Defaults to on unless `--eager`. |
+
 Experimental settings (off unless specified):
 
 | Setting | Effect |

@@ -28,7 +28,6 @@ layer norms and the output head in FP32, the time MLP in FP32.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
@@ -38,13 +37,18 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
 
-__all__ = ["LingBotDiT", "DiTResult", "rope_real", "rope_table", "rope_frequencies", "all_gather_into"]
+__all__ = ["LingBotDiT", "DiTResult", "cache_read_frames", "rope_real", "rope_table", "rope_frequencies",
+           "all_gather_into"]
 
 GRID_H, GRID_W = LATENT_HEIGHT // 2, LATENT_WIDTH // 2
 FRAME_TOKENS = GRID_H * GRID_W          # 1508
 TOKENS = CHUNK * FRAME_TOKENS           # 6032
-CACHE_FRAMES = int(os.environ.get("LB_CACHE_FRAMES", 18))  # rolling cache, incl. current chunk
-READ_FRAMES = tuple(dict.fromkeys(list(range(CHUNK, CACHE_FRAMES + 1, CHUNK)) + [CACHE_FRAMES]))
+CACHE_FRAMES = 18                       # default rolling cache, incl. current chunk
+
+
+def cache_read_frames(cache_frames):
+    """Cache lengths read while the rolling cache of ``cache_frames`` latent frames fills."""
+    return tuple(dict.fromkeys(list(range(CHUNK, cache_frames + 1, CHUNK)) + [cache_frames]))
 
 
 @torch.library.custom_op("fastframes_lingbot::all_gather_into", mutates_args=("out",))
@@ -144,13 +148,15 @@ class DiTResult:
 class LingBotDiT:
     """Chunk-wise evaluation of a ``WanModelFast`` against the rolling KV cache.
 
-    ``cache_k`` / ``cache_v``: ``[layers, 1, 18 * 1508, heads, head_dim]`` BF16, owned by the
-    caller (who also evicts frames between chunks). ``timesteps``: the denoising timesteps; the
-    last one is the one whose features and K/V are captured.
+    ``cache_k`` / ``cache_v``: ``[layers, 1, cache_frames * 1508, heads, head_dim]`` BF16, owned by
+    the caller (who also evicts frames between chunks). ``timesteps``: the denoising timesteps; the
+    last one is the one whose features and K/V are captured. ``attn`` / ``attn_cross`` /
+    ``sage_precenter`` / ``fp8``: attention backends and FP8 scope (``LingBotRuntimeConfig``).
     """
 
     def __init__(self, model, cache_k, cache_v, context, timesteps, *, world=1, rank=0, split_kv=1,
-                 compile=True, graphs=True, camera_sliced=False):
+                 compile=True, graphs=True, camera_sliced=False, cache_frames=CACHE_FRAMES, attn="auto",
+                 attn_cross="cudnn", sage_precenter=False, fp8="0"):
         if camera_sliced and not compile:
             raise ValueError("LB_DIT_CAMERA_SLICED=1 requires DiT compilation")
         self.model, self.cache_k, self.cache_v = model, cache_k, cache_v
@@ -161,14 +167,13 @@ class LingBotDiT:
         self.split_kv, self.use_graphs = int(split_kv), bool(graphs)
         from .sage_attention import use_sage
 
-        self.sage_self = use_sage(os.environ.get("LB_ATTN", "auto"), self.device, self.head_dim,
-                                  eligible=self.world == 1 and self.split_kv == 1)
-        self.sage_cross = use_sage(os.environ.get("LB_ATTN_CROSS", "cudnn"), self.device, self.head_dim,
-                                   eligible=self.world == 1)
-        self.sage_precenter = os.environ.get("LB_SAGE_PRECENTER") == "1"
+        self.sage_self = use_sage(attn, self.device, self.head_dim, eligible=self.world == 1 and self.split_kv == 1)
+        self.sage_cross = use_sage(attn_cross, self.device, self.head_dim, eligible=self.world == 1)
+        self.sage_precenter = bool(sage_precenter)
+        self.read_frames = cache_read_frames(cache_frames)
         self.timesteps = tuple(int(t) for t in timesteps) + (0,)
         self.final_timestep = self.timesteps[-2]
-        if TOKENS % self.world or (CACHE_FRAMES * FRAME_TOKENS) % self.split_kv:
+        if TOKENS % self.world or (cache_frames * FRAME_TOKENS) % self.split_kv:
             raise ValueError("world size must divide 6032 tokens and split_kv the cache length")
         if self.world > 1 and dist.get_world_size() != self.world:
             raise ValueError("initialize a matching NCCL process group first")
@@ -195,7 +200,6 @@ class LingBotDiT:
             torch.empty((1, CHUNK, 1, dim), device=device),
             torch.empty(shape, device=device, dtype=torch.bfloat16),
             torch.empty(shape, device=device, dtype=torch.bfloat16))
-        fp8 = os.environ.get("LB_FP8", "0")
         fp8_qkv = None
         if fp8 != "0":
             from .fp8 import quantize_dit
@@ -410,7 +414,7 @@ class LingBotDiT:
         timestep = int(timestep)
         capture = timestep == self.final_timestep if capture is None else bool(capture)
         key = (int(read_frames), capture)
-        if key[0] not in READ_FRAMES:
+        if key[0] not in self.read_frames:
             raise ValueError(f"unsupported cache length {read_frames}")
         self.x.copy_(x)
         self.time_e.copy_(self.time_bank[timestep][0])

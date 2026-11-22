@@ -180,6 +180,66 @@ def test_dit_graphs_default_and_overrides(world, graphs, override, expected, mon
     assert decoder.call_args.kwargs["graphs"] is graphs
 
 
+def test_runtime_config_defaults_follow_world_compile_and_graphs():
+    model = pipeline.MODELS["lingbot-1.3b"]
+    one = pipeline.LingBotRuntimeConfig.from_env(model, world=1, compile=True, graphs=True, environ={})
+    assert one == pipeline.LingBotRuntimeConfig(
+        steps=4, cache_frames=18, compile_dit=True, graphs_dit=False, camera_sliced=True, compile_refiner=True,
+        graphs_refiner=True, refiner_direct_kv=True, refiner_heads_per_stream=5, compile_decoder=True,
+        graphs_decoder=True, attn="auto", attn_cross="cudnn", sage_precenter=False, fp8="0",
+        expandable_segments=True)
+    eight = pipeline.LingBotRuntimeConfig.from_env(model, world=8, compile=False, graphs=True, environ={})
+    assert (eight.compile_dit, eight.graphs_dit, eight.camera_sliced, eight.compile_refiner,
+            eight.refiner_direct_kv, eight.refiner_heads_per_stream, eight.compile_decoder) == (
+        False, True, False, False, False, 30, False)
+    with pytest.raises(ValueError, match="1 or 8 GPUs"):
+        pipeline.LingBotRuntimeConfig.from_env(model, world=2, environ={})
+
+
+def test_runtime_config_reads_every_override():
+    environ = {"LB_STEPS": "2", "LB_CACHE_FRAMES": "10", "LB_COMPILE_DIT": "0", "LB_GRAPHS_DIT": "1",
+               "LB_DIT_CAMERA_SLICED": "1", "LB_COMPILE_REFINER": "0", "LB_GRAPHS_REFINER": "0",
+               "LB_REFINER_DIRECT_KV": "0", "LB_REFINER_HEADS_PER_STREAM": "10", "LB_COMPILE_DECODER": "0",
+               "LB_GRAPHS_DECODER": "0", "LB_ATTN": "sage", "LB_ATTN_CROSS": "sage", "LB_SAGE_PRECENTER": "1",
+               "LB_FP8": "ffn", "LB_EXPANDABLE_SEGMENTS": "0"}
+    config = pipeline.LingBotRuntimeConfig.from_env(pipeline.MODELS["lingbot-1.3b"], environ=environ)
+    assert config == pipeline.LingBotRuntimeConfig(
+        steps=2, cache_frames=10, compile_dit=False, graphs_dit=True, camera_sliced=True, compile_refiner=False,
+        graphs_refiner=False, refiner_direct_kv=False, refiner_heads_per_stream=10, compile_decoder=False,
+        graphs_decoder=False, attn="sage", attn_cross="sage", sage_precenter=True, fp8="ffn",
+        expandable_segments=False)
+
+
+def test_cache_read_frames():
+    assert dit.cache_read_frames(18) == (4, 8, 12, 16, 18)
+    assert dit.cache_read_frames(10) == (4, 8, 10)
+    assert dit.cache_read_frames(16) == (4, 8, 12, 16)
+
+
+def test_cache_frames_env_is_read_per_pipeline_and_passed_through(monkeypatch, upstream):
+    monkeypatch.setenv("LB_CACHE_FRAMES", "10")
+    with (patch.object(pipeline, "LingBotDiT") as runner, patch.object(pipeline, "KVRefiner") as kv,
+          patch.object(pipeline, "CapturedDecoder"), patch.object(pipeline, "rope_frequencies")):
+        pipe = pipeline.FastFramesLingBot(pipeline.MODELS["lingbot-1.3b"], upstream, None, None, graphs=False)
+    assert pipe.runtime.cache_frames == pipe.cache_frames == 10
+    assert pipe.cache_k.shape[2] == 10 * dit.FRAME_TOKENS
+    assert runner.call_args.kwargs["cache_frames"] == kv.call_args.kwargs["cache_frames"] == 10
+
+
+def test_explicit_runtime_ignores_environment(monkeypatch, upstream):
+    model = pipeline.MODELS["lingbot-1.3b"]
+    runtime = pipeline.LingBotRuntimeConfig.from_env(model, environ={"LB_STEPS": "2", "LB_ATTN": "cudnn"})
+    for name in ("LB_STEPS", "LB_ATTN", "LB_COMPILE_DIT"):
+        monkeypatch.setenv(name, "1")
+    with (patch.object(pipeline, "LingBotDiT") as runner, patch.object(pipeline, "KVRefiner"),
+          patch.object(pipeline, "CapturedDecoder"), patch.object(pipeline, "rope_frequencies")):
+        pipe = pipeline.FastFramesLingBot(model, upstream, None, None, compile=False, runtime=runtime)
+    assert pipe.runtime is runtime
+    assert len(pipe.timesteps) == 2
+    args = runner.call_args.kwargs
+    assert (args["compile"], args["attn"], args["attn_cross"], args["fp8"]) == (True, "cudnn", "cudnn", "0")
+
+
 def test_direct_refiner_commit_matches_staged_commit(monkeypatch):
     monkeypatch.setattr(refiner, "TOKENS", 4)
     monkeypatch.setattr(refiner, "FRAME_TOKENS", 2)
