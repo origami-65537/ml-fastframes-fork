@@ -184,12 +184,20 @@ class LingBotDiT:
             torch.empty(shape, device=device, dtype=torch.bfloat16),
             torch.empty(shape, device=device, dtype=torch.bfloat16))
         fp8 = os.environ.get("LB_FP8", "0")
+        int8 = os.environ.get("LB_INT8", "0")
+        if fp8 != "0" and int8 != "0":
+            raise ValueError("LB_FP8 and LB_INT8 are mutually exclusive")
         fp8_qkv = None
         if fp8 != "0":
             from .fp8 import quantize_dit
 
             fp8_qkv = quantize_dit(model, scope=fp8, mode=os.environ.get("LB_FP8_DIAG", "scaled"),
                                    direct_input=os.environ.get("LB_FP8_DIRECT_INPUT") == "1")
+        if int8 != "0":
+            from .int8 import quantize_dit as quantize_dit_int8
+
+            fp8_qkv = quantize_dit_int8(model, scope=int8, mode=os.environ.get("LB_INT8_DIAG", "scaled"),
+                                        direct_input=os.environ.get("LB_INT8_DIRECT_INPUT") == "1")
         self.qkv = ([(linear, None) for linear in fp8_qkv] if fp8_qkv is not None else
                     [(torch.cat([b.self_attn.q.weight, b.self_attn.k.weight, b.self_attn.v.weight]),
                       torch.cat([b.self_attn.q.bias, b.self_attn.k.bias, b.self_attn.v.bias]))
