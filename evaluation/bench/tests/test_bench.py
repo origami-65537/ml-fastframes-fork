@@ -1,6 +1,5 @@
 import json
 import math
-from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -66,7 +65,7 @@ def test_every_repeat(monkeypatch, tmp_path, capsys, case):
              "reference": 255-good, "shape": good[:1]}[case]
     videos = iter([first, good])
     monkeypatch.setattr(fixed_bench, "adapter", lambda args:
-                        (lambda: next(videos), lambda: None, good.shape, None, nullcontext, None))
+                        fixed_bench.Workload(lambda: next(videos), lambda: None, good.shape))
     for name in ("set_device", "synchronize", "reset_peak_memory_stats"):
         monkeypatch.setattr(torch.cuda, name, lambda *args: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -393,8 +392,8 @@ def test_fps_gate_and_repeat_diff():
 
 def fake_bench(monkeypatch, generate=None, timing_scope=None):
     video = torch.randint(40, 210, (2, 12, 12, 3), generator=torch.Generator().manual_seed(0), dtype=torch.uint8)
-    monkeypatch.setattr(fixed_bench, "adapter", lambda args: (generate or (lambda: video), lambda: None,
-                                                              video.shape, None, nullcontext, timing_scope))
+    monkeypatch.setattr(fixed_bench, "adapter", lambda args: fixed_bench.Workload(
+        generate or (lambda: video), lambda: None, video.shape, timing_scope=timing_scope))
     for name in ("set_device", "synchronize", "reset_peak_memory_stats"):
         monkeypatch.setattr(torch.cuda, name, lambda *args: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -522,9 +521,10 @@ def test_lingbot_adapter_start_once(monkeypatch, tmp_path, fail_start):
             fixed_bench.adapter(args)
         assert calls == [("start", 7, 2 * lingbot.CHUNK), ("close",)]
         return
-    generate, close, expected, _, _, scope = fixed_bench.adapter(args)
-    assert scope == "steps only (start untimed)"
-    assert expected == (2 * lingbot.CHUNK * 4 - 3, 464, 832, 3)
+    workload = fixed_bench.adapter(args)
+    generate, close = workload.generate, workload.close
+    assert workload.timing_scope == "steps only (start untimed)"
+    assert workload.expected_shape == (2 * lingbot.CHUNK * 4 - 3, 464, 832, 3)
     assert calls == [("start", 7, 2 * lingbot.CHUNK)]
     for _ in range(3):
         assert generate().shape == (2, 2, 2, 3)
