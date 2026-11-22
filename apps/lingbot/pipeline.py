@@ -130,7 +130,7 @@ class FastFramesLingBot:
         env = lambda name, default: os.environ.get(name, str(int(default))) == "1"  # noqa: E731
         self.dit = LingBotDiT(dit, self.cache_k, self.cache_v, context, self.timesteps, world=world, rank=rank,
                               split_kv=model.split_kv[world], compile=env("LB_COMPILE_DIT", compile),
-                              graphs=env("LB_GRAPHS_DIT", graphs))
+                              graphs=env("LB_GRAPHS_DIT", graphs and world != 1))
         result = self.dit.result
         heads_per_stream = int(os.environ.get("LB_REFINER_HEADS_PER_STREAM", model.kv_layers_per_stream[world]))
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
