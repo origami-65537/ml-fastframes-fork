@@ -36,7 +36,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
+from .conditioning import CHUNK, CONDITION_CHANNELS, LATENT_CHANNELS, LATENT_HEIGHT, LATENT_WIDTH, PATCH_COLUMNS, PATCH_IN
 
 __all__ = ["LingBotDiT", "DiTResult", "rope_real", "rope_table", "rope_frequencies", "all_gather_into"]
 
@@ -181,8 +181,8 @@ class LingBotDiT:
         dim, device = self.dim, self.device
         self.local_tokens = TOKENS // self.world
         self.start, self.end = self.rank * self.local_tokens, (self.rank + 1) * self.local_tokens
-        self.x = torch.zeros((16, CHUNK, LATENT_HEIGHT, LATENT_WIDTH), device=device)
-        self.y = torch.empty((20, CHUNK, LATENT_HEIGHT, LATENT_WIDTH), device=device)
+        self.x = torch.zeros((LATENT_CHANNELS, CHUNK, LATENT_HEIGHT, LATENT_WIDTH), device=device)
+        self.y = torch.empty((CONDITION_CHANNELS, CHUNK, LATENT_HEIGHT, LATENT_WIDTH), device=device)
         self.camera = torch.empty((1, 384, CHUNK, LATENT_HEIGHT, LATENT_WIDTH), device=device, dtype=torch.bfloat16)
         self.rope = torch.empty((TOKENS, 1, self.head_dim // 2, 2), device=device)
         self.time_e = torch.empty((1, 1, dim), device=device)
@@ -276,7 +276,8 @@ class LingBotDiT:
     # ------------------------------------------------------------------ compiled pieces
     def _patch(self):
         inputs = torch.cat([self.x, self.y], 0)[None]
-        tokens = inputs.reshape(1, 36, CHUNK, GRID_H, 2, GRID_W, 2).permute(0, 2, 3, 5, 1, 4, 6).reshape(1, TOKENS, 144)
+        tokens = inputs.reshape(1, PATCH_IN, CHUNK, GRID_H, 2, GRID_W, 2).permute(0, 2, 3, 5, 1, 4, 6)
+        tokens = tokens.reshape(1, TOKENS, PATCH_COLUMNS)
         patch = self.model.patch_embedding
         return F.linear(tokens[:, self.start:self.end], patch.weight.reshape(self.dim, -1), patch.bias)
 

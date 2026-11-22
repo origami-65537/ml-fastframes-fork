@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
+from .conditioning import CHUNK, CONDITION_CHANNELS, LATENT_CHANNELS, LATENT_HEIGHT, LATENT_WIDTH, PATCH_COLUMNS, PATCH_IN
 from .dit import FRAME_TOKENS, READ_FRAMES, TOKENS, rope_real
 
 __all__ = ["KVRefiner"]
@@ -46,10 +46,10 @@ class _Stem(torch.nn.Module):
         if self.world > 1:
             frame = self.rank // 2
             x, y = x[:, frame:frame + 1], y[:, frame:frame + 1]
-        # Conv3d(36 -> dim, kernel (1, 2, 2)) as a channel-major GEMM plus BF16 bias.
+        # Conv3d(PATCH_IN -> dim, kernel (1, 2, 2)) as a channel-major GEMM plus BF16 bias.
         value = torch.cat((x, y), 0).to(torch.bfloat16)
-        columns = value.reshape(36, self.frames, LATENT_HEIGHT // 2, 2, LATENT_WIDTH // 2, 2)
-        columns = columns.permute(0, 3, 5, 1, 2, 4).reshape(144, -1)
+        columns = value.reshape(PATCH_IN, self.frames, LATENT_HEIGHT // 2, 2, LATENT_WIDTH // 2, 2)
+        columns = columns.permute(0, 3, 5, 1, 2, 4).reshape(PATCH_COLUMNS, -1)
         stem = (self.patch.weight.flatten(1) @ columns) + self.patch.bias[:, None]
         stem = stem.T.reshape(self.frames, FRAME_TOKENS, -1)
         phi = self.net.compute_phi(stem, self.embedding).reshape(1, self.frames * FRAME_TOKENS, -1)
@@ -100,7 +100,7 @@ class KVRefiner:
     """Refine the chunk's cache slot in place: ``refiner(x0, y, rope, read_frames)``.
 
     ``key`` / ``value`` are the DiT's captured canonical K/V ``[layers, 1, 6032, heads, head_dim]``;
-    ``cache_k`` / ``cache_v`` the rolling cache ``[layers, 1, 18 * 1508, heads, head_dim]``.
+    ``cache_k`` / ``cache_v`` the rolling cache ``[layers, 1, CACHE_FRAMES * FRAME_TOKENS, heads, head_dim]``.
     """
 
     def __init__(self, net, patch, cache_k, cache_v, key, value, timestep, *, world=1, rank=0,
@@ -121,8 +121,8 @@ class KVRefiner:
         self.k, self.v = key.view(layers, TOKENS, dim), value.view(layers, TOKENS, dim)
         self.use_graphs, self.graphs = graphs, {}
         device = self.k.device
-        self.x = torch.empty(16, CHUNK, LATENT_HEIGHT, LATENT_WIDTH, device=device)
-        self.y = torch.empty(20, CHUNK, LATENT_HEIGHT, LATENT_WIDTH, device=device)
+        self.x = torch.empty(LATENT_CHANNELS, CHUNK, LATENT_HEIGHT, LATENT_WIDTH, device=device)
+        self.y = torch.empty(CONDITION_CHANNELS, CHUNK, LATENT_HEIGHT, LATENT_WIDTH, device=device)
         self.rope = torch.empty(TOKENS, 1, net.head_dim // 2, 2, device=device)
         self.count = heads_per_stream
         with torch.autocast("cuda", enabled=False):
