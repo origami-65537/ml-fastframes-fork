@@ -150,6 +150,19 @@ class FastFrames:
                    decoder_net.to(device, dtype=config.decoder_dtype).eval().requires_grad_(False),
                    text_encoder)
 
+    @classmethod
+    def from_spec(cls, spec: ModelSpec, checkpoint_dir, config: Optional[FastFramesConfig] = None, *,
+                  device="cuda"):
+        """Build a released model from ``<checkpoint_dir>`` (see docs/installation.md#checkpoints).
+
+        ``config`` overrides ``spec.config``; the process-wide backends are configured from it.
+        """
+        config = spec.config if config is None else config
+        root = Path(checkpoint_dir)
+        configure_backends(config)
+        return cls.from_pretrained(config, root / spec.wan_dir, root / spec.dit, root / spec.refiner,
+                                   root / spec.decoder, device=device)
+
     def autocast(self):
         if self.config.autocast:
             return torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False)

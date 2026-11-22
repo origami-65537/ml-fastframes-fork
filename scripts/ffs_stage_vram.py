@@ -16,12 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from fastframes.pipeline import MODELS, FastFrames, configure_backends, to_uint8
+from fastframes.pipeline import MODELS, FastFrames, to_uint8
 from fastframes.video import save_video
-
-spec = MODELS["ff-s"]
-root = Path("checkpoints")
-configure_backends(spec.config)
 
 
 def vram(tag):
@@ -31,8 +27,7 @@ def vram(tag):
 
 
 t0 = time.perf_counter()
-model = FastFrames.from_pretrained(
-    spec.config, root / spec.wan_dir, root / spec.dit, root / spec.refiner, root / spec.decoder)
+model = FastFrames.from_spec(MODELS["ff-s"], "checkpoints")
 print(f"load done {time.perf_counter()-t0:.1f}s")
 vram("after load")
 

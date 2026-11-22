@@ -18,17 +18,13 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from fastframes.pipeline import MODELS, FastFrames, configure_backends  # noqa: E402
+from fastframes.pipeline import MODELS, FastFrames  # noqa: E402
 from fastframes.video import save_video  # noqa: E402
 
 
 def load_model(name, checkpoint_dir):
     """Build a released model from ``<checkpoint_dir>`` (see docs/installation.md#checkpoints)."""
-    spec = MODELS[name]
-    root = Path(checkpoint_dir)
-    configure_backends(spec.config)
-    return FastFrames.from_pretrained(
-        spec.config, root / spec.wan_dir, root / spec.dit, root / spec.refiner, root / spec.decoder)
+    return FastFrames.from_spec(MODELS[name], checkpoint_dir)
 
 
 def main():
