@@ -388,9 +388,10 @@ def main():
         parser.error("set LINGBOT_WORLD_ROOT or --lingbot-root to the pinned upstream clone "
                      "(see docs/lingbot.md)")
     if args.gpus == 8:
-        for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
-            if "expandable_segments:true" in os.environ.get(name, "").replace(" ", "").lower():
-                parser.error(f"unset {name}: expandable segments are unsupported on the eight-GPU path")
+        from apps.lingbot.pipeline import expandable_segments_requested  # torch only on the eight-GPU path
+
+        if name := expandable_segments_requested():
+            parser.error(f"unset {name}: expandable segments are unsupported on the eight-GPU path")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.profile_vram:
         profile(args)

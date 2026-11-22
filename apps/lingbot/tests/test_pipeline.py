@@ -25,6 +25,22 @@ def test_only_configure_expandable_segments_by_default(monkeypatch, allocator_en
             settings.assert_called_once_with("expandable_segments:True")
 
 
+@pytest.mark.parametrize(("env", "expected"), [
+    ({}, None),
+    ({"PYTORCH_ALLOC_CONF": "expandable_segments:False"}, None),
+    ({"PYTORCH_ALLOC_CONF": "expandable_segments: True"}, "PYTORCH_ALLOC_CONF"),
+    ({"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64,Expandable_Segments:true"}, "PYTORCH_CUDA_ALLOC_CONF"),
+    ({"PYTORCH_ALLOC_CONF": "expandable_segments:True", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+     "PYTORCH_CUDA_ALLOC_CONF"),
+])
+def test_expandable_segments_requested(monkeypatch, env, expected):
+    for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert pipeline.expandable_segments_requested() == expected
+
+
 def test_cache_frames_must_keep_sink_frames():
     minimum = pipeline.SINK_FRAMES + pipeline.CHUNK
     pipeline._check_cache_frames(minimum)
