@@ -19,6 +19,7 @@ from PIL import Image
 
 ACTIONS = {"idle", "forward", "backward", "left", "right", "yaw_left", "yaw_right"}
 LATENTS = 240
+MODEL = "lingbot-1.3b"
 
 
 def _worker(rank, config, commands, replies, rendezvous):
@@ -27,6 +28,7 @@ def _worker(rank, config, commands, replies, rendezvous):
     import torch.distributed as dist
 
     from apps.lingbot.conditioning import KeyboardCamera, LiveCamera
+    from apps.lingbot.generate import OFFICIAL, SHARED_ASSETS
     from apps.lingbot.pipeline import FastFramesLingBot, configure_backends
 
     pipe = None
@@ -52,11 +54,10 @@ def _worker(rank, config, commands, replies, rendezvous):
                 if pipe is None:
                     root = Path(config["checkpoint_dir"])
                     pipe = FastFramesLingBot.from_pretrained(
-                        "lingbot-1.3b", lingbot_root=config["lingbot_root"],
-                        lingbot_checkpoint=config.get("lingbot_checkpoint") or
-                        root / "lingbot-world-v2-1.3b-causal-fast",
-                        assets_dir=config.get("assets_dir") or root / "lingbot-world-v2-14b-causal-fast",
-                        checkpoint_dir=root / "lingbot-1.3b", world=world, rank=rank)
+                        MODEL, lingbot_root=config["lingbot_root"],
+                        lingbot_checkpoint=config.get("lingbot_checkpoint") or root / OFFICIAL[MODEL],
+                        assets_dir=config.get("assets_dir") or root / SHARED_ASSETS,
+                        checkpoint_dir=root / MODEL, world=world, rank=rank)
                     keys, camera = KeyboardCamera(), LiveCamera()
                 next_fingerprint = (hashlib.sha256(request["image"]).hexdigest(), request["prompt"])
                 if fingerprint == next_fingerprint:

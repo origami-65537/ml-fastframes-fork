@@ -76,6 +76,15 @@ def configure_backends():
     torch.backends.cudnn.benchmark = False
 
 
+def expandable_segments_requested() -> str | None:
+    """The allocator variable that enables expandable segments, if any."""
+    # Context parallel with expandable segments ended in an illegal memory access during warm-up.
+    for name in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        if "expandable_segments:true" in os.environ.get(name, "").replace(" ", "").lower():
+            return name
+    return None
+
+
 def _configure_allocator(device, world):
     if (world == 1 and torch.device(device).type == "cuda" and torch.version.hip is None
             and os.environ.get("LB_EXPANDABLE_SEGMENTS", "1") == "1"

@@ -25,7 +25,7 @@ import torch.distributed as dist  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from apps.lingbot.conditioning import CHUNK, KeyboardCamera, LiveCamera, Trajectory  # noqa: E402
-from apps.lingbot.pipeline import MODELS, FastFramesLingBot, configure_backends  # noqa: E402
+from apps.lingbot.pipeline import MODELS, FastFramesLingBot, configure_backends, expandable_segments_requested  # noqa: E402
 from apps.lingbot.upstream import import_upstream  # noqa: E402
 from fastframes.video import save_video  # noqa: E402
 
@@ -53,11 +53,9 @@ def init_distributed():
         raise RuntimeError(f"FastFrames-LingBot runs on 1 or 8 GPUs, not {world}")
     torch.cuda.set_device(local_rank)
     if world > 1:
-        # Context parallel with expandable segments ended in an illegal memory access during warm-up.
-        for name in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
-            if "expandable_segments:true" in os.environ.get(name, "").replace(" ", "").lower():
-                raise RuntimeError(f"{name}={os.environ[name]!r}: expandable segments are not supported with "
-                                   f"more than one GPU; unset {name}")
+        if name := expandable_segments_requested():
+            raise RuntimeError(f"{name}={os.environ[name]!r}: expandable segments are not supported with "
+                               f"more than one GPU; unset {name}")
         dist.init_process_group("nccl", timeout=timedelta(minutes=30), device_id=torch.device("cuda", local_rank))
     return world, rank
 
