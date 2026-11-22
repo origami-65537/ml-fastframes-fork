@@ -135,6 +135,63 @@ def test_explicitly_sliced_camera_requires_dit_compilation():
 
 
 @pytest.mark.parametrize(
+    "tma,epilogue,expected",
+    [
+        ("0", "0", {}),
+        ("1", "0", {"triton.enable_persistent_tma_matmul": True}),
+        ("0", "1", {"max_epilogue_benchmarked_choices": 4}),
+        ("1", "1", {"triton.enable_persistent_tma_matmul": True, "max_epilogue_benchmarked_choices": 4}),
+    ],
+)
+def test_gemm_options_only_apply_to_the_dit_block(monkeypatch, tma, epilogue, expected):
+    from torch._inductor import list_mode_options
+
+    monkeypatch.setenv("LB_DIT_TMA_GEMM", tma)
+    monkeypatch.setenv("LB_DIT_GEMM_EPILOGUE_TUNE", epilogue)
+    monkeypatch.setenv("LB_FP8", "0")
+    monkeypatch.setenv("LB_ATTN", "cudnn")
+    monkeypatch.setenv("LB_ATTN_CROSS", "cudnn")
+    monkeypatch.setattr(dit, "TOKENS", 4)
+    m = torch.nn.Module()
+    m.dim, m.num_heads = 8, 1
+    m.patch_embedding = torch.nn.Linear(8, 8)
+    block = torch.nn.Module()
+    m.blocks = torch.nn.ModuleList([block])
+    block.self_attn = torch.nn.Module()
+    block.self_attn.q = torch.nn.Linear(8, 8)
+    block.self_attn.k = torch.nn.Linear(8, 8)
+    block.self_attn.v = torch.nn.Linear(8, 8)
+    block.cam_scale_layer = torch.nn.Linear(8, 8)
+    block.cam_shift_layer = torch.nn.Linear(8, 8)
+    time_bank = {1: (torch.empty(1, 1, 8), torch.empty(1, 1, 6, 8))}
+
+    with (patch.object(dit.LingBotDiT, "set_context"),
+          patch.object(dit.LingBotDiT, "_time_bank", return_value=time_bank),
+          patch.object(torch, "compile") as compile_fn):
+        dit.LingBotDiT(m, None, None, None, (1,), graphs=False, camera_sliced=True)
+
+    mode = "max-autotune-no-cudagraphs"
+    calls = {c.args[0].__name__: c.kwargs for c in compile_fn.call_args_list}
+    block_config = calls.pop("_block")
+    base_config = dict(dynamic=False, fullgraph=True, mode=mode)
+    assert set(calls) == {"_project_camera", "_write_camera_layer", "_patch", "_post"}
+    assert all(kwargs == base_config for kwargs in calls.values())
+    if expected:
+        options = {**list_mode_options(mode), **expected}
+        assert block_config == dict(dynamic=False, fullgraph=True, options=options)
+        torch.compile(torch.neg, **block_config)
+    else:
+        assert block_config == base_config
+
+
+@pytest.mark.parametrize("flag", ["LB_DIT_TMA_GEMM", "LB_DIT_GEMM_EPILOGUE_TUNE"])
+def test_dit_gemm_options_require_compilation(monkeypatch, flag):
+    monkeypatch.setenv(flag, "1")
+    with pytest.raises(ValueError, match=flag):
+        dit.LingBotDiT(None, None, None, None, (), compile=False)
+
+
+@pytest.mark.parametrize(
     ("world", "compile", "overrides", "expected"),
     [
         (1, True, {}, (True, True)),

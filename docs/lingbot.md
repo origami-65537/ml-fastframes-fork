@@ -49,6 +49,18 @@ graphs off, both starts produced bit-identical first chunks even with refiner an
 decoder graphs on. Set `LB_GRAPHS_DIT=1` to opt in on a GPU with enough memory, or
 `LB_GRAPHS_DIT=0` to turn them off on eight GPUs, where the default is unchanged.
 
+### DiT GEMM experiments
+
+| Setting | Effect |
+|---|---|
+| `LB_DIT_TMA_GEMM=1` | Add persistent Triton TMA GEMMs to the DiT block's autotune candidates on supported GPUs. |
+| `LB_DIT_GEMM_EPILOGUE_TUNE=1` | Try up to four eligible Triton GEMM templates for epilogue fusion instead of one. |
+
+Both are opt-in, require DiT compilation and leave camera, refiner and decoder
+autotuning unchanged. They do not quantize weights or activations, but a different
+kernel can still change rounding. Check video quality, warm throughput and cold
+compile cost before adopting them.
+
 ## Interactive demo (1.3B)
 
 After [LingBot setup](installation.md#lingbot), launch one mode:

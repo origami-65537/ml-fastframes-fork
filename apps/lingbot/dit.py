@@ -153,6 +153,13 @@ class LingBotDiT:
                  compile=True, graphs=True, camera_sliced=False):
         if camera_sliced and not compile:
             raise ValueError("LB_DIT_CAMERA_SLICED=1 requires DiT compilation")
+        block_options = {}
+        if os.environ.get("LB_DIT_TMA_GEMM") == "1":
+            block_options["triton.enable_persistent_tma_matmul"] = True
+        if os.environ.get("LB_DIT_GEMM_EPILOGUE_TUNE") == "1":
+            block_options["max_epilogue_benchmarked_choices"] = 4
+        if block_options and not compile:
+            raise ValueError("LB_DIT_TMA_GEMM and LB_DIT_GEMM_EPILOGUE_TUNE require DiT compilation")
         self.model, self.cache_k, self.cache_v = model, cache_k, cache_v
         self.world, self.rank = int(world), int(rank)
         self.dim, self.heads = model.dim, model.num_heads
@@ -234,10 +241,17 @@ class LingBotDiT:
         self.pool = torch.cuda.graph_pool_handle() if self.use_graphs else None
         self._camera_graph, self._chunk_staged = None, False
 
-        def compiled(fn):
+        mode = "max-autotune-no-cudagraphs"
+
+        def compiled(fn, options=None):
             if not compile:
                 return fn
-            return torch.compile(fn, dynamic=False, fullgraph=True, mode="max-autotune-no-cudagraphs")
+            if options:
+                from torch._inductor import list_mode_options
+
+                return torch.compile(fn, dynamic=False, fullgraph=True,
+                                     options={**list_mode_options(mode), **options})
+            return torch.compile(fn, dynamic=False, fullgraph=True, mode=mode)
         if camera_sliced:
             self._camera_project_run = compiled(self._project_camera)
             self._camera_layer_run = compiled(_write_camera_layer)
@@ -245,7 +259,7 @@ class LingBotDiT:
         else:
             self._camera_run = compiled(self._prepare_camera)
         self._patch_run = compiled(self._patch)
-        self._block_run = compiled(self._block)
+        self._block_run = compiled(self._block, block_options)
         self._post_run = compiled(self._post)
 
     # ------------------------------------------------------------------ constants
