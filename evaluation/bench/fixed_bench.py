@@ -80,14 +80,11 @@ def adapter(args):
     image, args.prompt, rays, chunks, seed = read_condition(args)
     pipe = load_pipeline(model_args, 1, 0)
     chunk_index = [0]
-    started = [False]
+    # Encode the condition once, untimed: start() offloads the VAE, so later runs restart() the session.
+    pipe.start(image, args.prompt, seed=seed, latents=CHUNK * chunks)
 
     def generate():
-        if started[0]:
-            pipe.restart(seed=seed)  # start() offloads the VAE; re-conditioning is not timed
-        else:
-            pipe.start(image, args.prompt, seed=seed, latents=CHUNK * chunks)
-            started[0] = True
+        pipe.restart(seed=seed)
         frames = []
         for chunk in range(chunks):
             chunk_index[0] = chunk
