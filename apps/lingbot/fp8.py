@@ -56,21 +56,28 @@ class FP8Linear(nn.Module):
 
 
 @torch.no_grad()
-def quantize_dit(model):
+def quantize_dit(model, *, scope="1"):
+    if scope not in ("1", "ffn", "attention"):
+        raise ValueError("LB_FP8 must be 0, 1, ffn, or attention")
     rowwise = rowwise_supported(model.patch_embedding.weight.device)
-    fused = nn.ModuleList()
+    fused = nn.ModuleList() if scope != "ffn" else None
     for block in model.blocks:
-        attention = block.self_attn
-        projections = (attention.q, attention.k, attention.v)
-        weight = torch.cat([projection.weight for projection in projections])
-        bias = torch.cat([projection.bias for projection in projections])
-        fused.append(FP8Linear(weight, bias, rowwise=rowwise))
-        del weight, bias
-        for projection in projections:
-            projection.register_parameter("weight", None)
-        for owner, name in ((attention, "o"), (block.cross_attn, "q"), (block.cross_attn, "o"),
-                            (block.ffn, "0"), (block.ffn, "2")):
+        targets = []
+        if fused is not None:
+            attention = block.self_attn
+            projections = (attention.q, attention.k, attention.v)
+            weight = torch.cat([projection.weight for projection in projections])
+            bias = torch.cat([projection.bias for projection in projections])
+            fused.append(FP8Linear(weight, bias, rowwise=rowwise))
+            del weight, bias
+            for projection in projections:
+                projection.register_parameter("weight", None)
+            targets.extend(((attention, "o"), (block.cross_attn, "q"), (block.cross_attn, "o")))
+        if scope != "attention":
+            targets.extend(((block.ffn, "0"), (block.ffn, "2")))
+        for owner, name in targets:
             linear = getattr(owner, name)
             setattr(owner, name, FP8Linear(linear.weight, linear.bias, rowwise=rowwise))
-    model.add_module("_lb_fp8_qkv", fused)
+    if fused is not None:
+        model.add_module("_lb_fp8_qkv", fused)
     return fused

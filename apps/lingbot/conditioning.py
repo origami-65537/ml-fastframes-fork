@@ -59,8 +59,11 @@ def image_condition(vae, image, latents, device):
     pixels = TF.to_tensor(image.convert("RGB")).sub_(0.5).div_(0.5)
     first = F.interpolate(pixels[None], size=(HEIGHT, WIDTH), mode="bicubic").transpose(0, 1)
     video = torch.cat([first, torch.zeros(3, 4 * (latents - 1), HEIGHT, WIDTH)], dim=1).to(device)
-    encoded = vae.encode([video])[0]
-    vae.model.cpu()
+    vae.model.to(device)
+    try:
+        encoded = vae.encode([video])[0]
+    finally:
+        vae.model.cpu()
     mask = torch.zeros(4, latents, LATENT_HEIGHT, LATENT_WIDTH, device=device, dtype=encoded.dtype)
     mask[:, 0] = 1
     return torch.cat([mask, encoded])

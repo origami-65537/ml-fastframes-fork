@@ -23,8 +23,8 @@ on one GPU or context parallel on eight GPUs.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -76,6 +76,14 @@ def configure_backends():
     torch.backends.cudnn.benchmark = False
 
 
+def _configure_allocator(device, world):
+    if (world == 1 and torch.device(device).type == "cuda" and torch.version.hip is None
+            and os.environ.get("LB_EXPANDABLE_SEGMENTS", "1") == "1"
+            and not any(name in os.environ for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"))
+            and torch.cuda.memory.get_allocator_backend() == "native"):
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+
+
 def load_refiner(path, config, device):
     state = load_state_dict(path)
     net = KVRefinementNetwork(dim=config.dim, num_heads=config.num_heads, head_dim=config.dim // config.num_heads,
@@ -122,11 +130,12 @@ class FastFramesLingBot:
         env = lambda name, default: os.environ.get(name, str(int(default))) == "1"  # noqa: E731
         self.dit = LingBotDiT(dit, self.cache_k, self.cache_v, context, self.timesteps, world=world, rank=rank,
                               split_kv=model.split_kv[world], compile=env("LB_COMPILE_DIT", compile),
-                              graphs=env("LB_GRAPHS_DIT", graphs))
+                              graphs=env("LB_GRAPHS_DIT", graphs and world != 1))
         result = self.dit.result
+        heads_per_stream = int(os.environ.get("LB_REFINER_HEADS_PER_STREAM", model.kv_layers_per_stream[world]))
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
                                  self.timesteps[-1], world=world, rank=rank,
-                                 heads_per_stream=model.kv_layers_per_stream[world],
+                                 heads_per_stream=heads_per_stream, direct_kv=env("LB_REFINER_DIRECT_KV", world == 1),
                                  compile=env("LB_COMPILE_REFINER", compile), graphs=env("LB_GRAPHS_REFINER", graphs))
         decoder_cls = CapturedDecoder if world == 1 else SpatialDecoder
         self.decoder = decoder_cls(decoder, compile=env("LB_COMPILE_DECODER", compile),
@@ -140,6 +149,7 @@ class FastFramesLingBot:
                         rank=0, compile=True, graphs=True, device="cuda"):
         """``lingbot_checkpoint``: official weights of the model (T5/VAE are also looked up in
         ``assets_dir``); ``checkpoint_dir``: ``kv_refiner.safetensors`` and ``pixel_decoder.safetensors``."""
+        _configure_allocator(device, world)
         import_upstream(lingbot_root)
         model = MODELS[name]
         upstream = load_upstream(model.config, lingbot_checkpoint, assets_dir,
@@ -155,8 +165,10 @@ class FastFramesLingBot:
 
     # ------------------------------------------------------------------ session
     def _park_cache(self):
-        """Move the (still-zero) rolling KV cache, the DiT and the camera buffer to the
-        CPU while conditioning; ``_unpark_cache`` restores them."""
+        """Park the rolling cache and DiT on the CPU while conditioning."""
+        # CUDA graphs retain addresses of weights, the camera buffer and KV storage.
+        self.dit.clear_graphs()
+        self.refiner.clear_graphs()
         self.dit.model.cpu()
         self.dit.camera_params.data = self.dit.camera_params.data.cpu()
         self.cache_k.data = self.cache_k.data.cpu()
