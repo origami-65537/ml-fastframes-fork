@@ -46,6 +46,7 @@ from .self_forcing import (
     SelfForcingRollout,
     balanced_exit,
 )
+from .step import check_finite_loss, clip_and_step, is_due
 
 __all__ = ["train", "score", "score_timesteps", "dmd_direction", "critic_loss"]
 
@@ -162,13 +163,10 @@ class DMDTrainer:
         with torch.no_grad():
             x = self.rollout(noise, cond, exits, bank)
         loss = critic_loss(self.fake, x, cond, self.scheduler, cfg)
-        raise_if_any_failed(None if torch.isfinite(loss) else FloatingPointError(f"critic loss {loss.item()}"),
-                            f"critic update {index + 1}")
+        check_finite_loss(loss, f"critic update {index + 1}", "critic loss")
         loss.backward()
-        grad_norm = self.fake.clip_grad_norm_(self.config.optimizer.max_grad_norm)
-        if not torch.isfinite(grad_norm):  # the norm is global, so every rank stops here
-            raise FloatingPointError(f"non-finite critic gradient norm at critic update {index + 1}")
-        self.fake_opt.step()
+        grad_norm = clip_and_step(self.fake, self.fake_opt, self.config.optimizer.max_grad_norm,
+                                  f"non-finite critic gradient norm at critic update {index + 1}")
         return {"critic_loss": all_reduce_mean(loss.detach().float()), "critic_grad_norm": grad_norm}
 
     def generator_update(self, prompts, index):
@@ -193,12 +191,9 @@ class DMDTrainer:
             frame_loss = (0.5 * (x0 - target).square()).mean() / noise.shape[1]
             frame_loss.backward()
             loss += frame_loss.detach()
-        raise_if_any_failed(None if torch.isfinite(loss) else FloatingPointError(f"loss {loss.item()}"),
-                            f"generator update {index + 1}")
-        grad_norm = self.generator.clip_grad_norm_(self.config.optimizer.max_grad_norm)
-        if not torch.isfinite(grad_norm):
-            raise FloatingPointError(f"non-finite generator gradient norm at generator update {index + 1}")
-        self.generator_opt.step()
+        check_finite_loss(loss, f"generator update {index + 1}")
+        grad_norm = clip_and_step(self.generator, self.generator_opt, self.config.optimizer.max_grad_norm,
+                                  f"non-finite generator gradient norm at generator update {index + 1}")
         self.ema.update(self.generator, index + 1)
         return {"generator_loss": all_reduce_mean(loss.detach().float()), "generator_grad_norm": grad_norm,
                 "dmd_direction_l1": all_reduce_mean(direction.abs().mean().float())}
@@ -244,7 +239,7 @@ def train(config):
         logger.log({**metrics, "generator_updates": generator_updates}, critic_updates)
 
         final = critic_updates == cfg.max_critic_updates
-        if critic_updates % cfg.export_every == 0 or final:
+        if is_due(critic_updates, cfg.export_every, final):
             export = out / "exports" / f"step_{critic_updates:08d}"
             checkpoint.export_weights(export / "model.safetensors", trainer.generator, torch.bfloat16,
                                       is_main=ctx.is_main)
@@ -252,7 +247,7 @@ def train(config):
                 with trainer.ema.applied(trainer.generator):
                     checkpoint.export_weights(export / "ema.safetensors", trainer.generator, torch.bfloat16,
                                               is_main=ctx.is_main)
-        if critic_updates % cfg.save_every == 0 or final:
+        if is_due(critic_updates, cfg.save_every, final):
             rng = {"cpu": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(ctx.device)}
             checkpoint.save(out, critic_updates, models, optimizers,
                             {"ema": trainer.ema.state_dict(), "stream": stream.state_dict(),

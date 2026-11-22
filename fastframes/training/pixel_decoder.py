@@ -55,6 +55,7 @@ from .data import PromptStream, read_prompts
 from .distributed import all_reduce_mean, barrier, init_distributed, raise_if_any_failed, wrap_fsdp
 from .ema import EMA
 from .logging import MetricLogger
+from .step import check_finite_loss, is_due, step_if_finite
 
 __all__ = ["PrimedRollout", "reconstruction_loss", "rollout_seed", "build_decoder", "train"]
 
@@ -313,8 +314,7 @@ class Trainer:
             return reconstruction_loss(pred, target, self.loss)
 
     def _check(self, loss, what):
-        raise_if_any_failed(None if torch.isfinite(loss) else FloatingPointError(f"{what} {loss.item()}"),
-                            f"{what} at update {self.step + 1}")
+        check_finite_loss(loss, f"{what} at update {self.step + 1}", what)
 
     def _apply_gradients(self):
         max_norm = float(self.config.optimizer.max_grad_norm)
@@ -322,10 +322,7 @@ class Trainer:
             grad_norm = self.decoder.clip_grad_norm_(max_norm)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), max_norm)
-        if not torch.isfinite(grad_norm):  # the norm is global, so every rank stops here
-            raise FloatingPointError(f"non-finite decoder gradient norm at update {self.step + 1}")
-        self.optimizer.step()
-        return grad_norm
+        return step_if_finite(self.optimizer, grad_norm, f"non-finite decoder gradient norm at update {self.step + 1}")
 
     # ------------------------------------------------------------------ updates
     def reconstruction_update(self, pair):
@@ -417,10 +414,10 @@ class Trainer:
                     self.ema.update(self.decoder, self.step)
                 self.log(metrics, time.time() - start)
                 start = time.time()
-                if self.step % export_every == 0:
+                if is_due(self.step, export_every):
                     self.evaluate()
                     self.export()
-                if self.step % save_every == 0:
+                if is_due(self.step, save_every):
                     self.save()
             del pair, real
         if self.step % export_every:
