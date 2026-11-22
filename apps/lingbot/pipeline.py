@@ -134,9 +134,11 @@ class FastFramesLingBot:
         self.cache_v = torch.zeros_like(self.cache_k)
         context = torch.zeros(512, 4096, device=self.device, dtype=torch.bfloat16)
         env = lambda name, default: os.environ.get(name, str(int(default))) == "1"  # noqa: E731
+        compile_dit = env("LB_COMPILE_DIT", compile)
         self.dit = LingBotDiT(dit, self.cache_k, self.cache_v, context, self.timesteps, world=world, rank=rank,
-                              split_kv=model.split_kv[world], compile=env("LB_COMPILE_DIT", compile),
-                              graphs=env("LB_GRAPHS_DIT", graphs and world != 1))
+                              split_kv=model.split_kv[world], compile=compile_dit,
+                              graphs=env("LB_GRAPHS_DIT", graphs and world != 1),
+                              camera_sliced=env("LB_DIT_CAMERA_SLICED", compile_dit and world == 1))
         result = self.dit.result
         heads_per_stream = int(os.environ.get("LB_REFINER_HEADS_PER_STREAM", model.kv_layers_per_stream[world]))
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
