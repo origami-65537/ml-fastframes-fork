@@ -24,7 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 wandb = ["wandb"]
-lingbot = ["diffusers==0.31.0", "easydict", "imageio", "scipy", "tqdm"]  # modules of the upstream clone
+lingbot = ["diffusers==0.31.0", "easydict", "imageio", "scipy", "sageattention==1.0.6", "tqdm"]  # modules of the upstream clone; sageattention is the fast attention kernel used when LB_ATTN=auto
 demo = ["websockets>=15,<17", "Pillow>=12.3"]  # install together with the lingbot extra
 # modules of the baseline clones; setuptools for the Inductor build of their CPU-side code (latency)
 baselines = ["accelerate", "diffusers==0.31.0", "easydict", "omegaconf", "setuptools", "tqdm"]
