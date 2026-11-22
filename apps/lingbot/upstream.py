@@ -9,8 +9,10 @@ Imports a local clone at ``UPSTREAM_COMMIT``, selected by ``--lingbot-root`` or
 """
 from __future__ import annotations
 
+import gc
 import importlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -110,9 +112,58 @@ def load_upstream(config_name, ckpt_dir, assets_dir=None, *, fp32_time_weights, 
     from wan.modules.vae2_1 import Wan2_1_VAE
     from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
+    class LazyT5Encoder(T5EncoderModel):
+        """umT5 encoder that loads on first use and frees itself after each encode.
+
+        Upstream builds the ~5.6B-param encoder in fp32 on the CPU (~22GB peak)
+        and keeps it resident for the whole session — too much host RAM on a
+        32GB box. Deferring construction to the first ``__call__`` (after the
+        GPU-resident components are loaded), building on the ``meta`` device
+        and materializing with ``load_state_dict(assign=True)`` keeps the host
+        peak at about the checkpoint size; dropping the weights after the
+        encode leaves host RAM free for the denoise loop. Only ``__call__``
+        is used here, so the public surface stays identical.
+        """
+
+        def __init__(self, **kwargs):
+            self._kwargs = kwargs
+            self.text_len = kwargs["text_len"]
+            self.dtype = kwargs.get("dtype", torch.bfloat16)
+            self.device = kwargs.get("device", torch.device("cpu"))
+            self.checkpoint_path = kwargs.get("checkpoint_path")
+            self.tokenizer_path = kwargs.get("tokenizer_path")
+            self.model = None
+            self.tokenizer = None
+
+        def _materialize(self):
+            from wan.modules.t5 import HuggingfaceTokenizer, umt5_xxl
+            model = umt5_xxl(encoder_only=True, return_tokenizer=False,
+                             dtype=self.dtype, device="meta")
+            logging.info(f'loading {self.checkpoint_path}')
+            model.load_state_dict(torch.load(self.checkpoint_path, map_location="cpu"),
+                                  assign=True)
+            self.model = model.eval().requires_grad_(False)
+            shard_fn = self._kwargs.get("shard_fn")
+            if shard_fn is not None:
+                self.model = shard_fn(self.model, sync_module_states=False)
+            else:
+                self.model.to(self.device)
+            self.tokenizer = HuggingfaceTokenizer(name=self.tokenizer_path,
+                                                  seq_len=self.text_len, clean='whitespace')
+
+        def __call__(self, texts, device):
+            if self.model is None:
+                self._materialize()
+            try:
+                return super().__call__(texts, device)
+            finally:
+                del self.model
+                self.model = None
+                gc.collect()
+
     config = WAN_CONFIGS[config_name]
     ckpt_dir, assets_dir = str(ckpt_dir), None if assets_dir is None else str(assets_dir)
-    text_encoder = T5EncoderModel(
+    text_encoder = LazyT5Encoder(
         text_len=config.text_len, dtype=config.t5_dtype, device=torch.device("cpu"),
         checkpoint_path=_resolve_asset_path(config.t5_checkpoint, ckpt_dir, assets_dir),
         tokenizer_path=_resolve_asset_path(config.t5_tokenizer, ckpt_dir, assets_dir))
