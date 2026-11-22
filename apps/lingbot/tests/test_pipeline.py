@@ -25,6 +25,13 @@ def test_only_configure_expandable_segments_by_default(monkeypatch, allocator_en
             settings.assert_called_once_with("expandable_segments:True")
 
 
+def test_cache_frames_must_keep_sink_frames():
+    minimum = pipeline.SINK_FRAMES + pipeline.CHUNK
+    pipeline._check_cache_frames(minimum)
+    with pytest.raises(ValueError, match="LB_CACHE_FRAMES"):
+        pipeline._check_cache_frames(minimum - 1)
+
+
 def test_repeated_image_encoding_moves_vae_back_to_device(monkeypatch):
     for name in ("HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH"):
         monkeypatch.setattr(conditioning, name, 2)
