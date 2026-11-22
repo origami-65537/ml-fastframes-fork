@@ -42,6 +42,7 @@ from .flow_matching import (
 )
 from .logging import MetricLogger
 from .ode_data import OdeCorpus
+from .step import check_finite_loss, clip_and_step, is_due
 
 __all__ = ["train"]
 
@@ -116,25 +117,22 @@ def train(config):
             error = exc
         raise_if_any_failed(error, f"preparing update {step + 1}")
         loss = flow_loss(model, clean, noisy, timesteps, target, frame_weights, context)
-        raise_if_any_failed(None if torch.isfinite(loss) else FloatingPointError(f"loss {loss.item()}"),
-                            f"forward of update {step + 1}")
+        check_finite_loss(loss, f"forward of update {step + 1}")
         loss.backward()
-        grad_norm = model.clip_grad_norm_(opt_cfg.max_grad_norm)
-        if not torch.isfinite(grad_norm):  # the norm is global, so every rank stops here
-            raise FloatingPointError(f"non-finite gradient norm at update {step + 1}")
-        optimizer.step()
+        grad_norm = clip_and_step(model, optimizer, opt_cfg.max_grad_norm,
+                                  f"non-finite gradient norm at update {step + 1}")
         step += 1
         ema.update(model, step)
         logger.log({"loss": all_reduce_mean(loss.detach()), "grad_norm": grad_norm, "lr": lr}, step)
 
         final = step == config.train.max_updates
-        if step % config.train.export_every == 0 or final:
+        if is_due(step, config.train.export_every, final):
             # Raw FP32 masters (the consistency stage starts from these) and BF16 EMA weights.
             export = out / "exports" / f"step_{step:08d}"
             checkpoint.export_weights(export / "model.safetensors", model, is_main=ctx.is_main)
             with ema.applied(model):
                 checkpoint.export_weights(export / "ema.safetensors", model, torch.bfloat16, is_main=ctx.is_main)
-        if step % config.train.save_every == 0 or final:
+        if is_due(step, config.train.save_every, final):
             checkpoint.save(out, step, {"model": model}, {"model": (model, optimizer)},
                             {"ema": ema.state_dict(), "stream": stream.state_dict()},
                             keep=config.train.keep_checkpoints, is_main=ctx.is_main)

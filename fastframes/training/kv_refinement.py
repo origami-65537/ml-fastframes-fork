@@ -54,6 +54,7 @@ from . import checkpoint
 from .data import PromptStream, read_prompts
 from .distributed import barrier, init_distributed, raise_if_any_failed
 from .logging import MetricLogger
+from .step import check_finite_loss, step_if_finite
 
 __all__ = ["Capture", "Rollout", "MasterAdamW", "build_refiner", "refine_cache", "slot_loss", "train"]
 
@@ -305,7 +306,8 @@ class MasterAdamW:
         self.master.zero_grad(set_to_none=True)
 
     @torch.no_grad()
-    def step(self):
+    def step(self, update):
+        """Apply the gradients as 1-based ``update``; returns the global gradient norm."""
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         live, masters = list(self.network.parameters()), list(self.master.parameters())
         grads = [p.grad.float() for p in live]  # the gradients themselves for an FP32 network
@@ -321,7 +323,7 @@ class MasterAdamW:
                                / (norm + 1e-6), max=1.0)
             for master, g in zip(masters, grads):
                 master.grad = g.mul_(coef)
-        self.optimizer.step()
+        step_if_finite(self.optimizer, norm, f"non-finite gradient norm at update {update}")
         self.sync_live()
         return norm
 
@@ -439,8 +441,9 @@ class Trainer:
             loss, metrics = slot_loss(self.refiner, self.rollout.refine_timestep, cap, frame, queries,
                                       **self.loss_args)
             self.optimizer.zero_grad()
+            check_finite_loss(loss, f"forward of update {self.step + 1}")
             loss.backward()
-            metrics["grad_norm"] = self.optimizer.step()
+            metrics["grad_norm"] = self.optimizer.step(self.step + 1)
             metrics["frame"] = frame
             self.logger.log(metrics, self.step)
             if self.ctx.is_main and self.step % int(self.config.train.print_every) == 0:
