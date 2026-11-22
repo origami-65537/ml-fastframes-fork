@@ -7,7 +7,8 @@
 LingBot-World v2 continues a first image under a prompt and a camera path. Each step
 generates a chunk of four latent frames (16 RGB frames, one second at 16 fps) with four
 denoising steps against a rolling KV cache of 18 latent frames, the first 6 of which are
-kept as attention sinks. FastFrames-LingBot keeps the official DiT and its schedule and
+kept as attention sinks (step count, cache length and the optimizations below are
+``LingBotRuntimeConfig`` settings). FastFrames-LingBot keeps the official DiT and its schedule and
 
 * replaces the clean ``t = 0`` re-evaluation of every chunk by KV refinement (``refiner.py``;
   the first chunk keeps its clean pass),
@@ -24,6 +25,7 @@ on one GPU or context parallel on eight GPUs.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,7 +42,7 @@ from .dit import CACHE_FRAMES, FRAME_TOKENS, LingBotDiT, rope_frequencies, rope_
 from .refiner import KVRefiner
 from .upstream import import_upstream, load_upstream
 
-__all__ = ["LingBotModel", "MODELS", "FastFramesLingBot", "configure_backends"]
+__all__ = ["LingBotModel", "LingBotRuntimeConfig", "MODELS", "FastFramesLingBot", "configure_backends"]
 
 SINK_FRAMES = 6
 MAX_LATENTS = 1024  # length of the upstream RoPE table
@@ -69,6 +71,65 @@ MODELS = {
 }
 
 
+@dataclass(frozen=True)
+class LingBotRuntimeConfig:
+    """Effective runtime settings of a ``FastFramesLingBot``, resolved once by ``from_env``.
+
+    Each field has an ``LB_*`` environment override (see ``docs/lingbot.md``); boolean overrides
+    are on only for ``"1"``. ``steps``: denoising steps spread over the official schedule;
+    ``cache_frames``: rolling KV cache length in latent frames, including the current chunk.
+    """
+
+    steps: int
+    cache_frames: int
+    compile_dit: bool
+    graphs_dit: bool
+    camera_sliced: bool
+    compile_refiner: bool
+    graphs_refiner: bool
+    refiner_direct_kv: bool
+    refiner_heads_per_stream: int
+    compile_decoder: bool
+    graphs_decoder: bool
+    attn: str
+    attn_cross: str
+    sage_precenter: bool
+    fp8: str
+    expandable_segments: bool
+
+    @classmethod
+    def from_env(cls, model: LingBotModel, *, world=1, compile=True, graphs=True,
+                 environ: Mapping[str, str] | None = None):
+        """Defaults derived from ``compile`` / ``graphs`` / ``world``, overridden by ``LB_*`` variables."""
+        if world not in model.kv_layers_per_stream:
+            raise ValueError("FastFrames-LingBot runs on 1 or 8 GPUs")
+        environ = os.environ if environ is None else environ
+        heads_per_stream = model.kv_layers_per_stream[world]
+
+        def flag(name, default):
+            return environ.get(name, str(int(default))) == "1"
+
+        compile_dit = flag("LB_COMPILE_DIT", compile)
+        return cls(
+            steps=int(environ.get("LB_STEPS", 4)),
+            cache_frames=int(environ.get("LB_CACHE_FRAMES", CACHE_FRAMES)),
+            compile_dit=compile_dit,
+            graphs_dit=flag("LB_GRAPHS_DIT", graphs and world != 1),
+            camera_sliced=flag("LB_DIT_CAMERA_SLICED", compile_dit and world == 1),
+            compile_refiner=flag("LB_COMPILE_REFINER", compile),
+            graphs_refiner=flag("LB_GRAPHS_REFINER", graphs),
+            refiner_direct_kv=flag("LB_REFINER_DIRECT_KV", world == 1),
+            refiner_heads_per_stream=int(environ.get("LB_REFINER_HEADS_PER_STREAM", heads_per_stream)),
+            compile_decoder=flag("LB_COMPILE_DECODER", compile),
+            graphs_decoder=flag("LB_GRAPHS_DECODER", graphs),
+            attn=environ.get("LB_ATTN", "auto"),
+            attn_cross=environ.get("LB_ATTN_CROSS", "cudnn"),
+            sage_precenter=environ.get("LB_SAGE_PRECENTER") == "1",
+            fp8=environ.get("LB_FP8", "0"),
+            expandable_segments=environ.get("LB_EXPANDABLE_SEGMENTS", "1") == "1",
+        )
+
+
 def configure_backends():
     """Process-wide settings FastFrames-LingBot was evaluated with."""
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -76,9 +137,9 @@ def configure_backends():
     torch.backends.cudnn.benchmark = False
 
 
-def _configure_allocator(device, world):
+def _configure_allocator(device, world, expandable_segments=True):
     if (world == 1 and torch.device(device).type == "cuda" and torch.version.hip is None
-            and os.environ.get("LB_EXPANDABLE_SEGMENTS", "1") == "1"
+            and expandable_segments
             and not any(name in os.environ for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"))
             and torch.cuda.memory.get_allocator_backend() == "native"):
         torch.cuda.memory._set_allocator_settings("expandable_segments:True")
@@ -106,21 +167,27 @@ def _check_cache_frames(cache_frames):
 
 
 class FastFramesLingBot:
-    """One session at a time; under context parallelism every rank makes the same calls."""
+    """One session at a time; under context parallelism every rank makes the same calls.
+
+    ``runtime`` defaults to ``LingBotRuntimeConfig.from_env(model, world=world, compile=compile,
+    graphs=graphs)``; ``compile`` / ``graphs`` are only used to derive those defaults.
+    """
 
     def __init__(self, model: LingBotModel, upstream, refiner, decoder, *, world=1, rank=0, compile=True,
-                 graphs=True):
+                 graphs=True, runtime: LingBotRuntimeConfig = None):
         if world not in (1, 8):
             raise ValueError("FastFrames-LingBot runs on 1 or 8 GPUs")
-        _check_cache_frames(CACHE_FRAMES)
+        if runtime is None:
+            runtime = LingBotRuntimeConfig.from_env(model, world=world, compile=compile, graphs=graphs)
+        _check_cache_frames(runtime.cache_frames)
+        self.runtime, self.cache_frames = runtime, runtime.cache_frames
         self.model, self.upstream, self.world, self.rank = model, upstream, world, rank
         dit = upstream.dit
         self.device = dit.patch_embedding.weight.device
         scheduler = upstream.scheduler
         scheduler.set_timesteps(upstream.config.num_train_timesteps, shift=model.shift)
         self.scheduler = scheduler
-        steps = int(os.environ.get("LB_STEPS", 4))
-        indices = [round(i) for i in torch.linspace(0, 750, steps).tolist()]
+        indices = [round(i) for i in torch.linspace(0, 750, runtime.steps).tolist()]
         self.schedule = scheduler.timesteps[indices]
         self.timesteps = tuple(int(t) for t in self.schedule)
         # sigma of every step, located like the upstream flow -> x0 conversion (float64)
@@ -129,25 +196,23 @@ class FastFramesLingBot:
         head_dim = dit.dim // dit.num_heads
         self.freqs = rope_frequencies(head_dim, self.device)
         dit.freqs = self.freqs
-        shape = (len(dit.blocks), 1, CACHE_FRAMES * FRAME_TOKENS, dit.num_heads, head_dim)
+        shape = (len(dit.blocks), 1, self.cache_frames * FRAME_TOKENS, dit.num_heads, head_dim)
         self.cache_k = torch.zeros(shape, device=self.device, dtype=torch.bfloat16)
         self.cache_v = torch.zeros_like(self.cache_k)
         context = torch.zeros(512, 4096, device=self.device, dtype=torch.bfloat16)
-        env = lambda name, default: os.environ.get(name, str(int(default))) == "1"  # noqa: E731
-        compile_dit = env("LB_COMPILE_DIT", compile)
         self.dit = LingBotDiT(dit, self.cache_k, self.cache_v, context, self.timesteps, world=world, rank=rank,
-                              split_kv=model.split_kv[world], compile=compile_dit,
-                              graphs=env("LB_GRAPHS_DIT", graphs and world != 1),
-                              camera_sliced=env("LB_DIT_CAMERA_SLICED", compile_dit and world == 1))
+                              split_kv=model.split_kv[world], compile=runtime.compile_dit,
+                              graphs=runtime.graphs_dit, camera_sliced=runtime.camera_sliced,
+                              cache_frames=self.cache_frames, attn=runtime.attn, attn_cross=runtime.attn_cross,
+                              sage_precenter=runtime.sage_precenter, fp8=runtime.fp8)
         result = self.dit.result
-        heads_per_stream = int(os.environ.get("LB_REFINER_HEADS_PER_STREAM", model.kv_layers_per_stream[world]))
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
                                  self.timesteps[-1], world=world, rank=rank,
-                                 heads_per_stream=heads_per_stream, direct_kv=env("LB_REFINER_DIRECT_KV", world == 1),
-                                 compile=env("LB_COMPILE_REFINER", compile), graphs=env("LB_GRAPHS_REFINER", graphs))
+                                 heads_per_stream=runtime.refiner_heads_per_stream,
+                                 direct_kv=runtime.refiner_direct_kv, compile=runtime.compile_refiner,
+                                 graphs=runtime.graphs_refiner, cache_frames=self.cache_frames)
         decoder_cls = CapturedDecoder if world == 1 else SpatialDecoder
-        self.decoder = decoder_cls(decoder, compile=env("LB_COMPILE_DECODER", compile),
-                                   graphs=env("LB_GRAPHS_DECODER", graphs))
+        self.decoder = decoder_cls(decoder, compile=runtime.compile_decoder, graphs=runtime.graphs_decoder)
         self.prompt = self.condition = self.noise = self.generator = None
         self.noise_mode = "clip"
         self.latents = self.chunk = 0
@@ -157,15 +222,16 @@ class FastFramesLingBot:
                         rank=0, compile=True, graphs=True, device="cuda"):
         """``lingbot_checkpoint``: official weights of the model (T5/VAE are also looked up in
         ``assets_dir``); ``checkpoint_dir``: ``kv_refiner.safetensors`` and ``pixel_decoder.safetensors``."""
-        _configure_allocator(device, world)
-        import_upstream(lingbot_root)
         model = MODELS[name]
+        runtime = LingBotRuntimeConfig.from_env(model, world=world, compile=compile, graphs=graphs)
+        _configure_allocator(device, world, runtime.expandable_segments)
+        import_upstream(lingbot_root)
         upstream = load_upstream(model.config, lingbot_checkpoint, assets_dir,
                                  fp32_time_weights=model.fp32_time_weights, device=device)
         root = Path(checkpoint_dir)
         refiner = load_refiner(root / "kv_refiner.safetensors", upstream.config, device)
         decoder = load_decoder(root / "pixel_decoder.safetensors", upstream.config, device)
-        return cls(model, upstream, refiner, decoder, world=world, rank=rank, compile=compile, graphs=graphs)
+        return cls(model, upstream, refiner, decoder, world=world, rank=rank, runtime=runtime)
 
     @property
     def num_chunks(self):
@@ -232,8 +298,8 @@ class FastFramesLingBot:
 
     def _evict(self, chunk):
         """Before writing ``chunk``: drop the oldest non-sink frames of a full cache (one shift per chunk)."""
-        previous = min(CHUNK * chunk, CACHE_FRAMES)
-        evicted = max(0, previous + CHUNK - CACHE_FRAMES)
+        previous = min(CHUNK * chunk, self.cache_frames)
+        evicted = max(0, previous + CHUNK - self.cache_frames)
         if evicted:
             sink, shift = SINK_FRAMES * FRAME_TOKENS, evicted * FRAME_TOKENS
             rolled = (previous - evicted - SINK_FRAMES) * FRAME_TOKENS
@@ -255,7 +321,7 @@ class FastFramesLingBot:
         chunk = self.chunk
         if self.condition is None or chunk >= self.num_chunks:
             raise RuntimeError("no session or horizon reached; call start() or restart()")
-        read_frames = min(CHUNK * (chunk + 1), CACHE_FRAMES)
+        read_frames = min(CHUNK * (chunk + 1), self.cache_frames)
         self._evict(chunk)
         y = self.condition[:, CHUNK * chunk:CHUNK * (chunk + 1)]
         rope = rope_table(self.freqs, CHUNK * chunk)

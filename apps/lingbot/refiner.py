@@ -26,7 +26,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
-from .dit import FRAME_TOKENS, READ_FRAMES, TOKENS, rope_real
+from .dit import CACHE_FRAMES, FRAME_TOKENS, TOKENS, cache_read_frames, rope_real
 
 __all__ = ["KVRefiner"]
 
@@ -100,11 +100,11 @@ class KVRefiner:
     """Refine the chunk's cache slot in place: ``refiner(x0, y, rope, read_frames)``.
 
     ``key`` / ``value`` are the DiT's captured canonical K/V ``[layers, 1, 6032, heads, head_dim]``;
-    ``cache_k`` / ``cache_v`` the rolling cache ``[layers, 1, 18 * 1508, heads, head_dim]``.
+    ``cache_k`` / ``cache_v`` the rolling cache ``[layers, 1, cache_frames * 1508, heads, head_dim]``.
     """
 
     def __init__(self, net, patch, cache_k, cache_v, key, value, timestep, *, world=1, rank=0,
-                 heads_per_stream=None, direct_kv=False, compile=True, graphs=True):
+                 heads_per_stream=None, direct_kv=False, compile=True, graphs=True, cache_frames=CACHE_FRAMES):
         import torch._inductor.config as inductor_config
         inductor_config.emulate_precision_casts = True
         if world not in (1, 8):
@@ -117,6 +117,7 @@ class KVRefiner:
             raise ValueError("heads_per_stream must be a positive divisor of the number of layers")
         self.world, self.rank, self.layers, self.dim = world, rank, layers, dim
         self.direct_kv = direct_kv
+        self.read_frames = cache_read_frames(cache_frames)
         self.cache_k, self.cache_v = cache_k, cache_v
         self.k, self.v = key.view(layers, TOKENS, dim), value.view(layers, TOKENS, dim)
         self.use_graphs, self.graphs = graphs, {}
@@ -196,7 +197,7 @@ class KVRefiner:
 
     @torch.no_grad()
     def __call__(self, x0, y, rope, read_frames):
-        if read_frames not in READ_FRAMES:
+        if read_frames not in self.read_frames:
             raise ValueError(f"unsupported cache length {read_frames}")
         self.x.copy_(x0)
         self.y.copy_(y)
